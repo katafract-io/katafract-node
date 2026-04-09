@@ -52,4 +52,5 @@ done
 systemctl enable katafract-pre-reboot.service
 log "  katafract-pre-reboot.service: enabled"
 
-log "Done. Agent version: $(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+VERSION=$(cat "$REPO_DIR/.git/refs/heads/main" 2>/dev/null | cut -c1-7 || echo unknown)
+log "Done. Agent version: $VERSION"
