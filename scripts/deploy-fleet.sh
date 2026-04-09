@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# deploy-fleet.sh — push katafract-node agent to all active VPN nodes
-# Run from artemis: bash scripts/deploy-fleet.sh
+# deploy-fleet.sh — bootstrap self-update on all active VPN nodes
 #
-# Syncs repo to /opt/katafract-node on each node, then runs install.sh
+# Normal workflow: push to GitHub → nodes self-update within 15 min.
+# Use this script to force immediate rollout (e.g. after a critical fix),
+# or to bootstrap the self-update mechanism on a node for the first time.
+#
+# Usage:
+#   bash scripts/deploy-fleet.sh           # all nodes
+#   bash scripts/deploy-fleet.sh 100.64.0.6  # single node
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_URL="https://github.com/katafractured/katafract-node.git"
 REMOTE_DIR="/opt/katafract-node"
 SSH_KEY="/home/artemis/.ssh/id_ed25519"
+SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
-NODES=(
+ALL_NODES=(
     "100.64.0.6"   # vpn-eu-01
     "100.64.0.7"   # vpn-eu-02
     "100.64.0.5"   # vpn-sin-01
@@ -18,54 +24,41 @@ NODES=(
     "100.64.0.21"  # vpn-us-west-01
 )
 
-log()  { echo "[deploy] $*"; }
-ok()   { echo "[deploy] ✓ $1"; }
-fail() { echo "[deploy] ✗ $1 — $2"; }
+log() { echo "[deploy] $*"; }
 
-deploy_node() {
+bootstrap_node() {
     local ip="$1"
-    local ssh="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$ip"
+    local ssh_cmd="ssh $SSH_OPTS root@$ip"
 
-    # Ensure target dir exists
-    $ssh "mkdir -p $REMOTE_DIR"
+    # Ensure git is installed
+    $ssh_cmd "apt-get install -y -qq git 2>/dev/null || true"
 
-    # Rsync repo contents (exclude git history and scripts not needed on node)
-    rsync -az --delete \
-        -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=no" \
-        --exclude=".git" \
-        --exclude="scripts/deploy-fleet.sh" \
-        --exclude="bootstrap.sh" \
-        "$REPO_DIR/" \
-        "root@$ip:$REMOTE_DIR/"
-
-    # Run install
-    $ssh "bash $REMOTE_DIR/install.sh"
+    if $ssh_cmd "[ -d $REMOTE_DIR/.git ]"; then
+        # Repo already present — just pull and install
+        $ssh_cmd "cd $REMOTE_DIR && git fetch --quiet origin main && git reset --hard origin/main --quiet && bash install.sh"
+    else
+        # Fresh clone
+        $ssh_cmd "git clone --depth=1 https://github.com/katafractured/katafract-node.git $REMOTE_DIR && bash $REMOTE_DIR/install.sh"
+    fi
 }
 
-log "Deploying from $REPO_DIR"
+# Target: single node or full fleet
+if [ "${1:-}" != "" ]; then
+    NODES=("$1")
+else
+    NODES=("${ALL_NODES[@]}")
+fi
+
 log "Nodes: ${NODES[*]}"
 echo ""
 
-pids=()
-results=()
-
 for ip in "${NODES[@]}"; do
     (
-        if deploy_node "$ip" 2>&1 | sed "s/^/[$ip] /"; then
-            echo "__OK__ $ip"
-        else
-            echo "__FAIL__ $ip"
-        fi
+        bootstrap_node "$ip" 2>&1 | sed "s/^/[$ip] /"
+        echo "[$ip] done"
     ) &
-    pids+=($!)
 done
 
-# Collect results
-ok_count=0
-fail_count=0
-for pid in "${pids[@]}"; do
-    wait "$pid"
-done
-
+wait
 echo ""
-log "Fleet deploy complete"
+log "Complete. Nodes will self-update every 15 min from GitHub going forward."

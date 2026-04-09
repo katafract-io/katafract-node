@@ -1,0 +1,10 @@
+[Unit]
+Description=Katafract node agent self-update — every 15 min
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+RandomizedDelaySec=3min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# katafract-update — self-update agent from GitHub
+# Runs every 15 min via systemd timer. Pulls katafract-node repo and
+# runs install.sh only when HEAD has changed. No-op if already current.
+
+set -euo pipefail
+
+REPO_URL="https://github.com/katafractured/katafract-node.git"
+REPO_DIR="/opt/katafract-node"
+BRANCH="main"
+LOG_TAG="katafract-update"
+
+source /etc/katafract-node.env 2>/dev/null || true
+NODE_ID="${KATAFRACT_NODE_ID:-unknown}"
+
+log()  { echo "[$LOG_TAG] [$NODE_ID] $*"; }
+fatal(){ echo "[$LOG_TAG] [$NODE_ID] FATAL: $*" >&2; exit 1; }
+
+# ── Clone if missing ──────────────────────────────────────────
+if [ ! -d "$REPO_DIR/.git" ]; then
+    log "Repo not found at $REPO_DIR — cloning"
+    apt-get install -y -qq git 2>/dev/null || true
+    git clone --depth=1 --branch "$BRANCH" "$REPO_URL" "$REPO_DIR" \
+        || fatal "git clone failed"
+    bash "$REPO_DIR/install.sh"
+    log "Initial install complete"
+    exit 0
+fi
+
+# ── Fetch + compare ───────────────────────────────────────────
+cd "$REPO_DIR"
+
+git fetch --quiet origin "$BRANCH" 2>&1 || { log "git fetch failed — skipping"; exit 0; }
+
+LOCAL=$(git rev-parse HEAD)
+REMOTE=$(git rev-parse "origin/$BRANCH")
+
+if [ "$LOCAL" = "$REMOTE" ]; then
+    log "Already at $BRANCH@${LOCAL:0:7} — nothing to do"
+    exit 0
+fi
+
+log "Update available: ${LOCAL:0:7} → ${REMOTE:0:7}"
+
+git reset --hard "origin/$BRANCH" --quiet
+bash "$REPO_DIR/install.sh"
+
+log "Update applied — now at ${REMOTE:0:7}"
