@@ -7,23 +7,27 @@
 #     | NODE_ID=vpn-eu-03 \
 #       WG_PRIVATE_KEY=<key> \
 #       WG_IPV4_TUNNEL=10.10.5.1/24 \
+#       WG_IPV6_TUNNEL=fd10:0:5::1/64 \
 #       WG_LISTEN_PORT=51820 \
 #       HEADSCALE_PREAUTH_KEY=<key> \
 #       NODE_AGENT_TOKEN=<token> \
+#       AGH_PASSWORD=<plaintext-password> \
 #       bash
 #
 # Required env vars:
-#   NODE_ID             — unique node identifier (e.g. vpn-eu-03)
-#   WG_PRIVATE_KEY      — WireGuard private key (wg genkey)
-#   WG_IPV4_TUNNEL      — WireGuard server interface IP/CIDR (e.g. 10.10.5.1/24)
-#   WG_LISTEN_PORT      — WireGuard listen port (default: 51820)
+#   NODE_ID               — unique node identifier (e.g. vpn-eu-03)
+#   WG_PRIVATE_KEY        — WireGuard private key (awg genkey)
+#   WG_IPV4_TUNNEL        — WireGuard server interface IP/CIDR (e.g. 10.10.5.1/24)
+#   WG_LISTEN_PORT        — WireGuard listen port (default: 51820)
 #   HEADSCALE_PREAUTH_KEY — reusable pre-auth key from headscale
-#   NODE_AGENT_TOKEN    — shared secret for heartbeat auth with artemis-api
+#   NODE_AGENT_TOKEN      — shared secret for heartbeat auth with artemis-api
+#   AGH_PASSWORD          — AdGuard Home admin password (plaintext, will be bcrypt-hashed)
 #
 # Optional:
-#   ARTEMIS_API_URL     — default: http://100.64.0.1/internal/nodes/heartbeat
-#   SITE                — display name (e.g. Frankfurt)
-#   REGION              — region slug (e.g. eu-west)
+#   WG_IPV6_TUNNEL        — WireGuard IPv6 tunnel address (e.g. fd10:0:5::1/64)
+#   ARTEMIS_HEARTBEAT_URL — default: http://100.64.0.1/internal/nodes/heartbeat
+#   SITE                  — display name (e.g. Frankfurt)
+#   REGION                — region slug (e.g. eu-west)
 
 set -euo pipefail
 
@@ -33,9 +37,11 @@ set -euo pipefail
 : "${WG_LISTEN_PORT:=51820}"
 : "${HEADSCALE_PREAUTH_KEY:?Required}"
 : "${NODE_AGENT_TOKEN:?Required}"
+: "${AGH_PASSWORD:?Required}"
 : "${ARTEMIS_HEARTBEAT_URL:=http://100.64.0.1/internal/nodes/heartbeat}"
 : "${SITE:=$NODE_ID}"
 : "${REGION:=unknown}"
+: "${WG_IPV6_TUNNEL:=}"
 
 WG_SERVER_IP=$(echo "$WG_IPV4_TUNNEL" | cut -d/ -f1)
 
@@ -47,12 +53,16 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get upgrade -y -qq
 apt-get install -y -qq \
-  wireguard \
-  nftables \
+  wireguard-tools \
+  iptables \
   fail2ban \
   curl wget jq git \
   net-tools htop \
-  ca-certificates gnupg
+  ca-certificates gnupg \
+  software-properties-common \
+  python3-bcrypt \
+  unattended-upgrades \
+  apt-listchanges
 
 # Disable swap
 swapoff -a 2>/dev/null || true
@@ -69,43 +79,71 @@ sysctl -p /etc/sysctl.d/99-katafract.conf
 
 echo "  [ok] system packages"
 
-# ── 2. WireGuard ──────────────────────────────────────────────
+# ── 2. AmneziaWG (obfuscated WireGuard) ──────────────────────
 
-mkdir -p /etc/wireguard
-chmod 700 /etc/wireguard
+add-apt-repository -y ppa:amnezia/ppa 2>&1 | tail -2
+apt-get update -qq
+apt-get install -y -qq amneziawg amneziawg-tools 2>&1 | tail -3
 
-echo "$WG_PRIVATE_KEY" > /etc/wireguard/private.key
-chmod 600 /etc/wireguard/private.key
-WG_PUBLIC_KEY=$(echo "$WG_PRIVATE_KEY" | wg pubkey)
+# Derive public key
+WG_PUBLIC_KEY=$(echo "$WG_PRIVATE_KEY" | awg pubkey)
 echo "$WG_PUBLIC_KEY" > /etc/wireguard/public.key
 
 # Detect default outbound interface
 DEFAULT_IFACE=$(ip route get 1.1.1.1 | grep -oP 'dev \K\S+')
 
-cat > /etc/wireguard/wg0.conf << EOF
+# AWG config goes in /etc/amnezia/amneziawg/ (awg-quick@wg0 looks here)
+mkdir -p /etc/amnezia/amneziawg
+chmod 700 /etc/amnezia/amneziawg
+
+# Build Address line (IPv4 + optional IPv6)
+if [ -n "$WG_IPV6_TUNNEL" ]; then
+  WG_ADDRESS="${WG_IPV4_TUNNEL}, ${WG_IPV6_TUNNEL}"
+  IPV6_MASQ="ip6tables -t nat -A POSTROUTING -s $(echo "$WG_IPV6_TUNNEL" | sed 's|::1/64|::/64|') -o ${DEFAULT_IFACE} -j MASQUERADE; "
+  IPV6_MASQ_DOWN="ip6tables -t nat -D POSTROUTING -s $(echo "$WG_IPV6_TUNNEL" | sed 's|::1/64|::/64|') -o ${DEFAULT_IFACE} -j MASQUERADE; "
+else
+  WG_ADDRESS="${WG_IPV4_TUNNEL}"
+  IPV6_MASQ=""
+  IPV6_MASQ_DOWN=""
+fi
+
+WG_SUBNET=$(echo "$WG_IPV4_TUNNEL" | sed 's|\.[0-9]*/|.0/|')
+
+cat > /etc/amnezia/amneziawg/wg0.conf << EOF
 [Interface]
-Address = ${WG_IPV4_TUNNEL}
+Address = ${WG_ADDRESS}
 ListenPort = ${WG_LISTEN_PORT}
 PrivateKey = ${WG_PRIVATE_KEY}
-PostUp   = nft add rule ip nat POSTROUTING oifname "${DEFAULT_IFACE}" masquerade
-PostUp   = nft add rule ip6 nat POSTROUTING oifname "${DEFAULT_IFACE}" masquerade
-PostDown = nft delete table ip nat 2>/dev/null || true
-PostDown = nft delete table ip6 nat 2>/dev/null || true
 
-# Peers added dynamically by Artemis via wg addconf
+# AWG obfuscation params (fleet-standard)
+Jc = 4
+Jmin = 40
+Jmax = 70
+S1 = 0
+S2 = 0
+H1 = 165494111
+H2 = 2783653322
+H3 = 825748096
+H4 = 2426479516
+
+# Peer isolation: clients get internet only, no mesh/P2P
+PostUp   = iptables -t nat -A POSTROUTING -s ${WG_SUBNET} -o ${DEFAULT_IFACE} -j MASQUERADE; ${IPV6_MASQ}iptables -A FORWARD -i wg0 -o ${DEFAULT_IFACE} -j ACCEPT; iptables -A FORWARD -i ${DEFAULT_IFACE} -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT; iptables -A FORWARD -i wg0 -o wg0 -j DROP; iptables -A FORWARD -i wg0 -d 100.64.0.0/10 -j DROP
+PostDown = iptables -t nat -D POSTROUTING -s ${WG_SUBNET} -o ${DEFAULT_IFACE} -j MASQUERADE; ${IPV6_MASQ_DOWN}iptables -D FORWARD -i wg0 -o ${DEFAULT_IFACE} -j ACCEPT; iptables -D FORWARD -i ${DEFAULT_IFACE} -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT; iptables -D FORWARD -i wg0 -o wg0 -j DROP; iptables -D FORWARD -i wg0 -d 100.64.0.0/10 -j DROP
+
+# Peers added dynamically by Artemis via awg addconf
 EOF
-chmod 600 /etc/wireguard/wg0.conf
+chmod 600 /etc/amnezia/amneziawg/wg0.conf
 
-systemctl enable wg-quick@wg0
-systemctl restart wg-quick@wg0
+systemctl enable awg-quick@wg0
+systemctl restart awg-quick@wg0
 
-echo "  [ok] WireGuard (interface: $WG_SERVER_IP, port: $WG_LISTEN_PORT)"
+echo "  [ok] AmneziaWG (interface: $WG_SERVER_IP, port: $WG_LISTEN_PORT)"
 
 # ── 3. AdGuard Home ───────────────────────────────────────────
 
-mkdir -p /opt/adguardhome/data
+mkdir -p /opt/adguardhome/conf /opt/adguardhome/work
 
-if ! command -v AdGuardHome &>/dev/null && [ ! -f /opt/adguardhome/AdGuardHome ]; then
+if [ ! -f /opt/adguardhome/AdGuardHome ]; then
   AGH_VER="v0.107.73"
   curl -fsSL "https://github.com/AdguardTeam/AdGuardHome/releases/download/${AGH_VER}/AdGuardHome_linux_amd64.tar.gz" \
     | tar -xz -C /tmp
@@ -113,32 +151,116 @@ if ! command -v AdGuardHome &>/dev/null && [ ! -f /opt/adguardhome/AdGuardHome ]
   chmod +x /opt/adguardhome/AdGuardHome
 fi
 
-# Write config — binds only on WireGuard interface (never public)
-cat > /opt/adguardhome/AdGuardHome.yaml << EOF
-bind_host: ${WG_SERVER_IP}
-bind_port: 3000
-auth_attempt_reset_time: 0
+# Hash the password with bcrypt
+AGH_BCRYPT=$(python3 -c "import bcrypt, sys; pw=sys.argv[1].encode(); print(bcrypt.hashpw(pw, bcrypt.gensalt(rounds=10)).decode())" "$AGH_PASSWORD")
+
+# Write config using the format compatible with AGH v0.107.73
+cat > /opt/adguardhome/conf/AdGuardHome.yaml << EOF
 http:
-  address: ${WG_SERVER_IP}:3000
+  pprof:
+    port: 6060
+    enabled: false
+  address: 127.0.0.1:3000
   session_ttl: 720h
-users: []
-language: en
+users:
+  - name: admin
+    password: ${AGH_BCRYPT}
+auth_attempts: 5
+block_auth_min: 15
+http_proxy: ""
+language: ""
 theme: auto
 dns:
   bind_hosts:
     - ${WG_SERVER_IP}
   port: 53
+  anonymize_client_ip: false
+  ratelimit: 20
+  ratelimit_subnet_len_ipv4: 24
+  ratelimit_subnet_len_ipv6: 56
+  ratelimit_whitelist: []
+  refuse_any: true
   upstream_dns:
-    - https://dns.quad9.net/dns-query
+    - https://dns10.quad9.net/dns-query
     - https://cloudflare-dns.com/dns-query
+  upstream_dns_file: ""
   bootstrap_dns:
     - 9.9.9.9
     - 1.1.1.1
   fallback_dns:
     - 9.9.9.9
+  upstream_mode: load_balance
+  fastest_timeout: 1s
+  allowed_clients: []
+  disallowed_clients: []
+  blocked_hosts:
+    - version.bind
+    - id.server
+    - hostname.bind
+  trusted_proxies:
+    - 127.0.0.0/8
+    - ::1/128
+  cache_size: 4194304
+  cache_ttl_min: 0
+  cache_ttl_max: 0
+  cache_optimistic: false
+  bogus_nxdomain: []
+  aaaa_disabled: false
+  enable_dnssec: false
+  edns_client_subnet:
+    custom_ip: ""
+    enabled: false
+    use_custom: false
+  max_goroutines: 300
+  handle_ddr: true
+  ipset: []
+  ipset_file: ""
+  bootstrap_prefer_ipv6: false
+  hostsfile_enabled: true
+  address_lists_cache_size: 0
+filtering:
+  blocking_ipv4: ""
+  blocking_ipv6: ""
+  blocked_services:
+    schedule:
+      time_zone: Local
+    ids: []
   protection_enabled: true
-  blocking_mode: default
+  filtering_enabled: true
+  parental_enabled: false
+  safebrowsing_enabled: false
+  safe_search:
+    enabled: false
+    bing: false
+    duckduckgo: false
+    ecosia: false
+    google: false
+    pixabay: false
+    yandex: false
+    youtube: false
   filters_update_interval: 24
+clients:
+  runtime_sources:
+    whois: true
+    arp: true
+    rdns: false
+    dhcp: true
+    hosts: true
+  persistent: []
+log:
+  enabled: true
+  file: ""
+  max_backups: 0
+  max_size: 100
+  max_age: 3
+  compress: false
+  local_time: false
+  verbose: false
+os:
+  group: ""
+  user: ""
+  rlimit_nofile: 0
+schema_version: 29
 filters:
   - enabled: true
     url: https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt
@@ -148,19 +270,18 @@ filters:
     url: https://big.oisd.nl
     name: OISD Full
     id: 2
-schema_version: 29
 EOF
 
-# Systemd unit
+# Systemd unit (uses conf/ subdir, consistent with fleet)
 cat > /etc/systemd/system/adguardhome.service << 'EOF'
 [Unit]
 Description=AdGuard Home DNS
-After=network-online.target wg-quick@wg0.service
+After=network-online.target awg-quick@wg0.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/adguardhome/AdGuardHome -c /opt/adguardhome/AdGuardHome.yaml -w /opt/adguardhome/data --no-check-update
+ExecStart=/opt/adguardhome/AdGuardHome -c /opt/adguardhome/conf/AdGuardHome.yaml -w /opt/adguardhome/work --no-check-update
 Restart=on-failure
 RestartSec=5
 
@@ -174,64 +295,50 @@ systemctl restart adguardhome
 
 echo "  [ok] AdGuard Home (DNS on ${WG_SERVER_IP}:53)"
 
-# ── 4. nftables firewall ──────────────────────────────────────
+# ── 4. UFW firewall ───────────────────────────────────────────
 
-cat > /etc/nftables.conf << EOF
-#!/usr/sbin/nft -f
-flush ruleset
+apt-get install -y -qq ufw
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp comment 'SSH'
+ufw allow "${WG_LISTEN_PORT}/udp" comment 'WireGuard AWG'
+ufw allow in on wg0 to any port 53 proto udp comment 'Haven DNS'
+ufw allow in on wg0 to any port 53 proto tcp comment 'Haven DNS TCP'
+ufw --force enable
 
-table inet filter {
-  chain input {
-    type filter hook input priority 0; policy drop;
+echo "  [ok] UFW firewall"
 
-    # Loopback
-    iifname "lo" accept
+# ── 5. SSH hardening ──────────────────────────────────────────
 
-    # Established/related
-    ct state established,related accept
+# Create artemis + tek users if missing
+for u in artemis tek; do
+  id "$u" &>/dev/null || useradd -m -s /bin/bash "$u"
+  usermod -p "*" "$u"  # unlock account without password (key-only)
+done
 
-    # SSH (public)
-    tcp dport 22 accept
+# Add the fleet SSH key to artemis and root
+FLEET_PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBY5cjHNONjEXa4tBJk8pz18IopLMDGqZbFMsxz8J3UG artemis@katafract.com"
+for u in artemis root; do
+  home=$(eval echo "~$u")
+  mkdir -p "$home/.ssh"
+  chmod 700 "$home/.ssh"
+  touch "$home/.ssh/authorized_keys"
+  if ! grep -qF "$FLEET_PUBKEY" "$home/.ssh/authorized_keys" 2>/dev/null; then
+    echo "$FLEET_PUBKEY" >> "$home/.ssh/authorized_keys"
+  fi
+  chmod 600 "$home/.ssh/authorized_keys"
+  chown -R "$u:$u" "$home/.ssh"
+done
 
-    # WireGuard (public)
-    udp dport ${WG_LISTEN_PORT} accept
+# Restrict root to mesh-only, allow artemis+tek from anywhere
+sed -i 's/^#\?AllowUsers.*//' /etc/ssh/sshd_config
+echo "AllowUsers root@100.64.* tek artemis" >> /etc/ssh/sshd_config
+systemctl reload sshd
 
-    # Tailscale mesh
-    udp dport 41641 accept
+echo "  [ok] SSH hardening (root mesh-only, artemis/tek anywhere)"
 
-    # ICMP
-    ip protocol icmp accept
-    ip6 nexthdr icmpv6 accept
-
-    # DNS on WireGuard interface only
-    iifname "wg0" udp dport 53 accept
-    iifname "wg0" tcp dport 53 accept
-
-    # Drop everything else
-    drop
-  }
-
-  chain forward {
-    type filter hook forward priority 0; policy drop;
-    # Allow WireGuard clients to forward outbound
-    iifname "wg0" accept
-    ct state established,related accept
-  }
-
-  chain output {
-    type filter hook output priority 0; policy accept;
-  }
-}
-
-# NAT table created dynamically by wg-quick PostUp
-EOF
-
-systemctl enable nftables
-systemctl restart nftables
-
-echo "  [ok] nftables firewall"
-
-# ── 5. node_exporter ─────────────────────────────────────────
+# ── 6. node_exporter ─────────────────────────────────────────
 
 if ! command -v node_exporter &>/dev/null; then
   NE_VER="1.8.2"
@@ -260,21 +367,23 @@ systemctl daemon-reload
 systemctl enable node_exporter
 systemctl restart node_exporter
 
-echo "  [ok] node_exporter (:9100, mesh-only via firewall)"
+echo "  [ok] node_exporter (:9100)"
 
-# ── 6. Katafract heartbeat agent ─────────────────────────────
+# ── 7. Katafract heartbeat agent ─────────────────────────────
 
+# Use awg show (not wg show) for AmneziaWG
 cat > /usr/local/bin/katafract-heartbeat << HBEOF
 #!/usr/bin/env bash
-# Katafract node heartbeat — reports WireGuard stats to Artemis
 set -euo pipefail
+
+source /etc/katafract-node.env
 
 ARTEMIS_URL="${ARTEMIS_HEARTBEAT_URL}"
 TOKEN="${NODE_AGENT_TOKEN}"
-NODE_ID="${NODE_ID}"
+NODE_ID="\${KATAFRACT_NODE_ID}"
 WG_IFACE="wg0"
 
-peers=\$(wg show "\$WG_IFACE" peers 2>/dev/null | wc -l)
+peers=\$(awg show "\$WG_IFACE" peers 2>/dev/null | wc -l)
 
 now=\$(date +%s)
 active_peers=0
@@ -283,14 +392,19 @@ while IFS= read -r line; do
   if [ "\$ts" != "0" ] && [ \$((now - ts)) -le 180 ]; then
     active_peers=\$((active_peers + 1))
   fi
-done < <(wg show "\$WG_IFACE" latest-handshakes 2>/dev/null)
+done < <(awg show "\$WG_IFACE" latest-handshakes 2>/dev/null)
 
 rx_bytes=0
 tx_bytes=0
 while IFS=\$'\t' read -r _ rx tx; do
   rx_bytes=\$((rx_bytes + rx))
   tx_bytes=\$((tx_bytes + tx))
-done < <(wg show "\$WG_IFACE" transfer 2>/dev/null)
+done < <(awg show "\$WG_IFACE" transfer 2>/dev/null)
+
+cpu_pct=\$(top -bn1 | awk '/^%Cpu/{print int(\$2+\$4)}' 2>/dev/null || echo 0)
+mem_pct=\$(free | awk '/^Mem/{printf "%d", \$3/\$2*100}' 2>/dev/null || echo 0)
+disk_pct=\$(df / | awk 'NR==2{print int(\$5)}' 2>/dev/null || echo 0)
+banned=\$(fail2ban-client status sshd 2>/dev/null | awk '/Currently banned/{print \$NF}' || echo 0)
 
 payload=\$(cat <<JSON
 {
@@ -299,6 +413,10 @@ payload=\$(cat <<JSON
   "active_peers": \$active_peers,
   "rx_bytes": \$rx_bytes,
   "tx_bytes": \$tx_bytes,
+  "cpu_pct": \$cpu_pct,
+  "mem_pct": \$mem_pct,
+  "disk_pct": \$disk_pct,
+  "fail2ban_banned": \$banned,
   "healthy": true
 }
 JSON
@@ -312,16 +430,14 @@ curl -sf -X POST "\$ARTEMIS_URL" \
 HBEOF
 chmod +x /usr/local/bin/katafract-heartbeat
 
-# Env file
 cat > /etc/katafract-node.env << EOF
 KATAFRACT_NODE_ID=${NODE_ID}
 EOF
 
-# Systemd timer (every 30s)
 cat > /etc/systemd/system/katafract-heartbeat.service << 'EOF'
 [Unit]
 Description=Katafract node heartbeat
-After=network-online.target wg-quick@wg0.service
+After=network-online.target awg-quick@wg0.service
 
 [Service]
 Type=oneshot
@@ -348,13 +464,12 @@ systemctl start katafract-heartbeat.timer
 
 echo "  [ok] katafract-heartbeat (30s timer)"
 
-# ── 7. Tailscale / Headscale mesh enrollment ─────────────────
+# ── 8. Tailscale / Headscale mesh enrollment ─────────────────
 
 if ! command -v tailscale &>/dev/null; then
   curl -fsSL https://tailscale.com/install.sh | sh
 fi
 
-# Join the headscale mesh (idempotent — tailscale up is safe to re-run)
 tailscale up \
   --login-server=https://mesh.katafract.io \
   --auth-key="${HEADSCALE_PREAUTH_KEY}" \
@@ -365,7 +480,34 @@ tailscale up \
 
 echo "  [ok] tailscale enrolled in headscale mesh"
 
-# ── 8. Node identity summary ──────────────────────────────────
+# ── 9. Unattended upgrades ────────────────────────────────────
+
+cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+
+cat > /etc/apt/apt.conf.d/52unattended-upgrades-katafract << 'EOF'
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}:${distro_codename}-updates";
+};
+Unattended-Upgrade::Package-Blacklist {
+    "linux-image-*";
+    "linux-headers-*";
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Mail "christian@katafract.com";
+Unattended-Upgrade::MailReport "on-change";
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+Unattended-Upgrade::Automatic-Reboot-Time "03:00";
+EOF
+
+echo "  [ok] unattended-upgrades (reboot time set to 03:00 — update in /etc/apt/apt.conf.d/52unattended-upgrades-katafract)"
+
+# ── 10. Node identity summary ─────────────────────────────────
 
 PUBLIC_IP=$(curl -sf https://api.ipify.org 2>/dev/null || echo "unknown")
 MESH_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
@@ -394,6 +536,5 @@ echo "  Public IP:          ${PUBLIC_IP}"
 echo "  Mesh IP:            ${MESH_IP}"
 echo "============================================"
 echo ""
-echo "  Next: register this node in Artemis DB"
-echo "  POST /internal/nodes/register with the above values"
+echo "  Reboot time: update /etc/apt/apt.conf.d/52unattended-upgrades-katafract"
 echo ""
