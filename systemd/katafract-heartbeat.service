@@ -1,0 +1,11 @@
+[Unit]
+Description=Katafract node heartbeat
+After=network-online.target awg-quick@wg0.service wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/katafract-heartbeat
+TimeoutStartSec=25
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# katafract-heartbeat — reports node health to Artemis every 30 s via systemd timer
+# Reads KATAFRACT_NODE_ID from /etc/katafract-node.env (set at provision time)
+set -euo pipefail
+
+ARTEMIS_URL="http://100.64.0.1/internal/nodes/heartbeat"
+TOKEN="e2675f896f618ac9eb23e05cb9686805bc4b3860f399a5e7e06e95582040b445"
+source /etc/katafract-node.env
+NODE_ID="$KATAFRACT_NODE_ID"
+WG_IFACE="wg0"
+
+# Prefer awg (AmneziaWG) — fall back to wg if not installed
+AWG=$(command -v awg || command -v wg || echo "")
+
+# ── WireGuard metrics ─────────────────────────────────────────
+
+registered_peers=0
+active_peers=0
+rx_bytes=0
+tx_bytes=0
+
+if [ -n "$AWG" ]; then
+    registered_peers=$("$AWG" show "$WG_IFACE" peers 2>/dev/null | wc -l || echo 0)
+
+    now=$(date +%s)
+    while IFS=$'\t' read -r _ ts; do
+        if [ "$ts" != "0" ] && [ $(( now - ts )) -le 180 ]; then
+            active_peers=$(( active_peers + 1 ))
+        fi
+    done < <("$AWG" show "$WG_IFACE" latest-handshakes 2>/dev/null || true)
+
+    while IFS=$'\t' read -r _ rx tx; do
+        rx_bytes=$(( rx_bytes + rx ))
+        tx_bytes=$(( tx_bytes + tx ))
+    done < <("$AWG" show "$WG_IFACE" transfer 2>/dev/null || true)
+fi
+
+# ── System metrics ────────────────────────────────────────────
+
+ncpu=$(nproc 2>/dev/null || echo 1)
+load1=$(awk '{print $1}' /proc/loadavg)
+cpu_pct=$(awk "BEGIN{v=$load1*100/$ncpu; if(v>100) v=100; printf \"%d\", v}")
+
+mem_total=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+mem_avail=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+mem_pct=$(( (mem_total - mem_avail) * 100 / mem_total ))
+
+disk_pct=$(df / 2>/dev/null | awk 'NR==2{gsub("%",""); print $5}')
+disk_pct=${disk_pct:-0}
+
+# fail2ban banned count — timeout each call to prevent hangs
+fail2ban_banned=0
+if timeout 3 systemctl is-active fail2ban >/dev/null 2>&1; then
+    jails=$(timeout 5 fail2ban-client status 2>/dev/null \
+        | awk -F':\t' '/Jail list/{print $2}' \
+        | tr ', ' '\n' | grep -v '^$')
+    if [ -n "$jails" ]; then
+        total=0
+        while IFS= read -r jail; do
+            count=$(timeout 5 fail2ban-client status "$jail" 2>/dev/null \
+                | awk '/Currently banned/{print $NF}')
+            total=$(( total + ${count:-0} ))
+        done <<< "$jails"
+        fail2ban_banned=$total
+    fi
+fi
+
+# ── Report ────────────────────────────────────────────────────
+
+curl -sf -X POST "$ARTEMIS_URL" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"node_id\":        \"$NODE_ID\",
+    \"peers\":          $registered_peers,
+    \"active_peers\":   $active_peers,
+    \"rx_bytes\":       $rx_bytes,
+    \"tx_bytes\":       $tx_bytes,
+    \"healthy\":        true,
+    \"cpu_pct\":        $cpu_pct,
+    \"mem_pct\":        $mem_pct,
+    \"disk_pct\":       $disk_pct,
+    \"fail2ban_banned\": $fail2ban_banned
+  }" \
+  --max-time 10 || true

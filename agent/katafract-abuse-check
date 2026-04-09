@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""
+katafract-abuse-check — per-peer daily bandwidth tracker with tc throttling.
+
+Thresholds:
+  WARN    50 GB/day  → 25 Mbps cap
+  SUSPEND 100 GB/day → 1 Mbps cap  (still up, effectively unusable for abuse)
+
+tc throttling uses HTB on wg0 egress, keyed by client WireGuard IP.
+Rules are ephemeral; re-applied every 5 min from state file after reboots.
+Daily state reset at midnight also clears all tc rules for this node.
+"""
+import json, os, subprocess, time, requests
+
+NODE_ID    = os.environ.get("KATAFRACT_NODE_ID", "UNSET")
+API        = "http://100.64.0.1/internal/nodes"
+TOKEN      = "e2675f896f618ac9eb23e05cb9686805bc4b3860f399a5e7e06e95582040b445"
+WG_IFACE   = "wg0"
+STATE_FILE = "/var/lib/katafract/abuse-state.json"
+
+WARN_GB    = 50
+SUSPEND_GB = 100
+WARN_MBPS  = 25    # cap at warn threshold
+SUSPEND_MBPS = 1   # cap at suspend threshold
+
+os.makedirs("/var/lib/katafract", exist_ok=True)
+
+
+# ── tc helpers ────────────────────────────────────────────────────────────────
+
+def _run(cmd):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def _htb_handle(client_ip: str) -> int:
+    """Map a WG client IP to a deterministic tc classid minor (2–254)."""
+    return int(client_ip.split(".")[-1])
+
+
+def _ensure_root_qdisc():
+    """Create HTB root qdisc on wg0 if not already present."""
+    r = _run(["tc", "qdisc", "show", "dev", WG_IFACE])
+    if "htb" not in r.stdout:
+        _run(["tc", "qdisc", "add", "dev", WG_IFACE, "root",
+              "handle", "1:", "htb", "default", "999"])
+        # default class: effectively unlimited
+        _run(["tc", "class", "add", "dev", WG_IFACE, "parent", "1:",
+              "classid", "1:999", "htb", "rate", "10gbit"])
+
+
+def apply_throttle(client_ip: str, rate_mbps: int):
+    """Apply (or replace) an HTB rate cap for a WG client IP."""
+    _ensure_root_qdisc()
+    handle = _htb_handle(client_ip)
+    classid = f"1:{handle}"
+    # Replace class (add if missing, update if present)
+    _run(["tc", "class", "del", "dev", WG_IFACE, "classid", classid])
+    _run(["tc", "class", "add", "dev", WG_IFACE, "parent", "1:",
+          "classid", classid, "htb", "rate", f"{rate_mbps}mbit",
+          "burst", "64k"])
+    # Remove existing filter for this IP, then re-add
+    _run(["tc", "filter", "del", "dev", WG_IFACE, "parent", "1:",
+          "protocol", "ip", "u32",
+          "match", "ip", "dst", f"{client_ip}/32"])
+    _run(["tc", "filter", "add", "dev", WG_IFACE, "parent", "1:",
+          "protocol", "ip", "u32",
+          "match", "ip", "dst", f"{client_ip}/32",
+          "flowid", classid])
+
+
+def remove_throttle(client_ip: str):
+    """Remove tc rate cap for a WG client IP."""
+    handle = _htb_handle(client_ip)
+    classid = f"1:{handle}"
+    _run(["tc", "filter", "del", "dev", WG_IFACE, "parent", "1:",
+          "protocol", "ip", "u32",
+          "match", "ip", "dst", f"{client_ip}/32"])
+    _run(["tc", "class", "del", "dev", WG_IFACE, "classid", classid])
+
+
+def clear_all_throttles():
+    """Nuke the root qdisc — removes all tc rules on wg0."""
+    _run(["tc", "qdisc", "del", "dev", WG_IFACE, "root"])
+
+
+# ── wg helpers ────────────────────────────────────────────────────────────────
+
+def _awg_show(subcmd: str) -> list[str]:
+    """Run `awg show <iface> <subcmd>`, fall back to `wg` if awg not found."""
+    for cmd in (["awg", "show", WG_IFACE, subcmd],
+                ["wg",  "show", WG_IFACE, subcmd]):
+        try:
+            return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).splitlines()
+        except FileNotFoundError:
+            continue
+        except Exception:
+            return []
+    return []
+
+
+def wg_transfers() -> dict[str, int]:
+    """pubkey → total bytes (rx+tx)."""
+    out = {}
+    for line in _awg_show("transfer"):
+        parts = line.split()
+        if len(parts) == 3:
+            out[parts[0]] = int(parts[1]) + int(parts[2])
+    return out
+
+
+def wg_peer_ips() -> dict[str, str]:
+    """pubkey → first IPv4 allowed-ip (the peer's WG client IP, e.g. 10.10.1.5)."""
+    out = {}
+    for line in _awg_show("allowed-ips"):
+        parts = line.split()
+        if len(parts) >= 2:
+            # pick first IPv4 (skip IPv6)
+            for cidr in parts[1:]:
+                ip = cidr.split("/")[0]
+                if ":" not in ip:
+                    out[parts[0]] = ip
+                    break
+    return out
+
+
+# ── state ─────────────────────────────────────────────────────────────────────
+
+def load_state() -> tuple[str, dict]:
+    today = time.strftime("%Y-%m-%d")
+    try:
+        s = json.load(open(STATE_FILE))
+        if s.get("date") == today:
+            return today, s.get("peers", {})
+    except Exception:
+        pass
+    return today, {}
+
+
+def save_state(today: str, peers: dict):
+    json.dump({"date": today, "peers": peers}, open(STATE_FILE, "w"))
+
+
+# ── report ────────────────────────────────────────────────────────────────────
+
+def report(alerts: list[dict]):
+    if not alerts:
+        return
+    try:
+        requests.post(
+            f"{API}/{NODE_ID}/abuse",
+            headers={"X-Node-Token": TOKEN},
+            json={"alerts": alerts},
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[abuse] report failed: {e}")
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    transfers = wg_transfers()
+    if not transfers:
+        return
+
+    peer_ips = wg_peer_ips()
+    today, peers = load_state()
+
+    # Detect day rollover — clear all tc rules and reset state
+    prev_date = None
+    try:
+        raw = json.load(open(STATE_FILE))
+        prev_date = raw.get("date")
+    except Exception:
+        pass
+
+    if prev_date and prev_date != today:
+        clear_all_throttles()
+        peers = {}
+
+    alerts = []
+
+    for pubkey, total_bytes in transfers.items():
+        total_gb   = total_bytes / 1e9
+        peer_state = peers.get(pubkey, {})
+        prev_total = peer_state.get("prev_total", 0)
+        daily_gb   = peer_state.get("daily_gb", 0.0)
+        status     = peer_state.get("status", "")
+        client_ip  = peer_ips.get(pubkey, "")
+
+        # Accumulate daily bytes (handle wg counter reset on peer removal/readd)
+        delta_bytes = total_bytes - prev_total if total_bytes >= prev_total else total_bytes
+        daily_gb += delta_bytes / 1e9
+
+        new_status = status
+
+        if daily_gb >= SUSPEND_GB and status != "suspended":
+            alerts.append({"pubkey": pubkey, "action": "suspend", "total_gb": daily_gb})
+            new_status = "suspended"
+            if client_ip:
+                apply_throttle(client_ip, SUSPEND_MBPS)
+
+        elif daily_gb >= WARN_GB and status not in ("warned", "suspended"):
+            alerts.append({"pubkey": pubkey, "action": "warn", "total_gb": daily_gb})
+            new_status = "warned"
+            if client_ip:
+                apply_throttle(client_ip, WARN_MBPS)
+
+        elif status == "suspended" and client_ip:
+            # Re-apply throttle on restart (state persists, tc rules don't)
+            apply_throttle(client_ip, SUSPEND_MBPS)
+
+        elif status == "warned" and client_ip:
+            apply_throttle(client_ip, WARN_MBPS)
+
+        peers[pubkey] = {
+            "prev_total": total_bytes,
+            "daily_gb":   daily_gb,
+            "status":     new_status,
+            "client_ip":  client_ip,
+        }
+
+    report(alerts)
+    save_state(today, peers)
+
+
+if __name__ == "__main__":
+    main()
