@@ -34,11 +34,11 @@ bootstrap_node() {
     $ssh_cmd "apt-get install -y -qq git 2>/dev/null || true"
 
     if $ssh_cmd "[ -d $REMOTE_DIR/.git ]"; then
-        # Repo already present — just pull and install
+        # Repo already present — fetch + reset to latest
         $ssh_cmd "cd $REMOTE_DIR && git fetch --quiet origin main && git reset --hard origin/main --quiet && bash install.sh"
     else
-        # Fresh clone
-        $ssh_cmd "git clone --depth=1 https://github.com/katafractured/katafract-node.git $REMOTE_DIR && bash $REMOTE_DIR/install.sh"
+        # Dir exists but not a git repo (legacy rsync) — wipe and clone
+        $ssh_cmd "rm -rf $REMOTE_DIR && git clone --depth=1 https://github.com/katafractured/katafract-node.git $REMOTE_DIR && bash $REMOTE_DIR/install.sh"
     fi
 }
 
