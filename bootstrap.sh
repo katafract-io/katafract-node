@@ -301,6 +301,7 @@ apt-get install -y -qq ufw
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
+ufw default allow routed
 ufw allow 22/tcp comment 'SSH'
 ufw allow "${WG_LISTEN_PORT}/udp" comment 'WireGuard AWG'
 ufw allow in on wg0 to any port 53 proto udp comment 'Haven DNS'
