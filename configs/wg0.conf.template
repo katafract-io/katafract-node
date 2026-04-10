@@ -2,10 +2,10 @@
 Address = ${WG_IPV4_TUNNEL}, ${WG_IPV6_TUNNEL}
 ListenPort = ${WG_LISTEN_PORT}
 PrivateKey = ${WG_PRIVATE_KEY}
-PostUp   = nft add rule ip nat POSTROUTING oifname "eth0" masquerade
-PostUp   = nft add rule ip6 nat POSTROUTING oifname "eth0" masquerade
-PostDown = nft delete rule ip nat POSTROUTING oifname "eth0" masquerade
-PostDown = nft delete rule ip6 nat POSTROUTING oifname "eth0" masquerade
+PostUp   = nft add rule ip nat POSTROUTING oifname "${DEFAULT_IFACE}" masquerade
+PostUp   = nft add rule ip6 nat POSTROUTING oifname "${DEFAULT_IFACE}" masquerade
+PostDown = nft delete rule ip nat POSTROUTING oifname "${DEFAULT_IFACE}" masquerade
+PostDown = nft delete rule ip6 nat POSTROUTING oifname "${DEFAULT_IFACE}" masquerade
 DNS = 127.0.0.1
 
 # Peers are added dynamically by Artemis
