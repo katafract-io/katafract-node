@@ -160,7 +160,7 @@ http:
   pprof:
     port: 6060
     enabled: false
-  address: 127.0.0.1:3000
+  address: 0.0.0.0:3000
   session_ttl: 720h
 users:
   - name: admin
