@@ -319,7 +319,8 @@ for u in artemis tek; do
 done
 
 # Add the fleet SSH key to artemis and root
-FLEET_PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBY5cjHNONjEXa4tBJk8pz18IopLMDGqZbFMsxz8J3UG artemis@katafract.com"
+# FLEET_PUBKEY env var takes precedence (injected by provisioner); fall back to embedded key
+FLEET_PUBKEY="${FLEET_PUBKEY:-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID2wuO8IVYfp0+mKvmOAI1QTyvnb3cRJ04ujX913Kd7I artemis@katafract.com}"
 for u in artemis root; do
   home=$(eval echo "~$u")
   mkdir -p "$home/.ssh"
