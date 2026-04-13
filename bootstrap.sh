@@ -318,6 +318,18 @@ for u in artemis tek; do
   usermod -p "*" "$u"  # unlock account without password (key-only)
 done
 
+# Grant artemis NOPASSWD sudo for fleet automation. Without this, every
+# remote `sudo` call from artemis-api / artemis-worker / scheduler hangs
+# waiting for a password prompt that never arrives.
+install -d -m 0750 /etc/sudoers.d
+cat > /etc/sudoers.d/90-artemis-nopasswd <<'SUDOERS'
+# Managed by katafract-node bootstrap.sh — do not edit manually.
+artemis ALL=(ALL) NOPASSWD: ALL
+SUDOERS
+chmod 0440 /etc/sudoers.d/90-artemis-nopasswd
+visudo -cf /etc/sudoers.d/90-artemis-nopasswd >/dev/null
+echo "  [ok] artemis NOPASSWD sudo"
+
 # Add the fleet SSH key to artemis and root
 # FLEET_PUBKEY env var takes precedence (injected by provisioner); fall back to embedded key
 FLEET_PUBKEY="${FLEET_PUBKEY:-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID2wuO8IVYfp0+mKvmOAI1QTyvnb3cRJ04ujX913Kd7I artemis@katafract.com}"
