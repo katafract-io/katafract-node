@@ -134,6 +134,14 @@ PostDown = iptables -t nat -D POSTROUTING -s ${WG_SUBNET} -o ${DEFAULT_IFACE} -j
 EOF
 chmod 600 /etc/amnezia/amneziawg/wg0.conf
 
+# Symlink /etc/wireguard/wg0.conf → /etc/amnezia/amneziawg/wg0.conf so the
+# platform API's _ssh_add_peer helper (which reads/writes the canonical
+# /etc/wireguard/wg0.conf path) works on AmneziaWG nodes without branching.
+# Without this, multi-hop provisioning fails with "Operation not permitted"
+# during the post-addconf dedup/rewrite step.
+mkdir -p /etc/wireguard
+ln -sf /etc/amnezia/amneziawg/wg0.conf /etc/wireguard/wg0.conf
+
 systemctl enable awg-quick@wg0
 systemctl restart awg-quick@wg0
 
