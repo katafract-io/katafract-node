@@ -95,7 +95,13 @@ echo -n "WG_UP="; awg show wg0 >/dev/null 2>&1 && echo OK || echo DOWN
 echo -n "AWG_MOD="; lsmod | grep -q amneziawg && echo OK || (lsmod | grep -q wireguard && echo WIREGUARD || echo NONE)
 echo -n "HB_TIMER="; systemctl is-active katafract-heartbeat.timer 2>&1
 echo -n "AGH="; systemctl is-active adguardhome 2>&1
-echo -n "NODE_EXPORTER="; systemctl is-active node-exporter 2>&1 || systemctl is-active node_exporter 2>&1
+echo -n "NODE_EXPORTER="
+for u in node_exporter node-exporter prometheus-node-exporter; do
+  if systemctl is-active --quiet "$u"; then
+    echo "active"; break
+  fi
+done | head -1
+[ -z "$(echo active)" ] && echo "inactive"
 echo -n "TAILSCALE="; tailscale status --peers=false 2>&1 | grep -q "^100\." && echo OK || echo DOWN
 echo -n "IPTABLES_FORWARD="; iptables -S FORWARD 2>/dev/null | grep -c wg0
 echo -n "SSH_ALLOWUSERS="; grep -rc 'AllowUsers.*root@100\.64\.\* tek artemis' /etc/ssh/sshd_config.d/ /etc/ssh/sshd_config 2>/dev/null | awk -F: '{s+=$NF} END{print s+0}'
