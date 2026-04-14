@@ -28,6 +28,10 @@
 #   ARTEMIS_HEARTBEAT_URL — default: http://100.64.0.1/internal/nodes/heartbeat
 #   SITE                  — display name (e.g. Frankfurt)
 #   REGION                — region slug (e.g. eu-west)
+#   REBOOT_HOUR_UTC       — HH:MM slot for unattended-upgrades auto-reboot.
+#                           Provisioner picks a free slot; defaults to 03:00
+#                           if unset. Avoid colliding with artemis (03:00)
+#                           and argus (04:00) on new nodes.
 
 set -euo pipefail
 
@@ -524,10 +528,10 @@ Unattended-Upgrade::Mail "christian@katafract.com";
 Unattended-Upgrade::MailReport "on-change";
 Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
-Unattended-Upgrade::Automatic-Reboot-Time "03:00";
+Unattended-Upgrade::Automatic-Reboot-Time "${REBOOT_HOUR_UTC:-03:00}";
 EOF
 
-echo "  [ok] unattended-upgrades (reboot time set to 03:00 — update in /etc/apt/apt.conf.d/52unattended-upgrades-katafract)"
+echo "  [ok] unattended-upgrades (reboot time set to ${REBOOT_HOUR_UTC:-03:00} UTC)"
 
 # ── 10. Node identity summary ─────────────────────────────────
 
