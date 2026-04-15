@@ -552,6 +552,37 @@ cat > /etc/katafract-node.json << EOF
 }
 EOF
 
+# ── 11. Self-register with platform (zero-touch) ────────────────
+
+echo "[ok] registering with platform..."
+_MESH_IP=$(tailscale ip -4 2>/dev/null | head -1 || echo "")
+_WG_PUBKEY=$(awg show wg0 public-key 2>/dev/null || wg show wg0 public-key 2>/dev/null || echo "")
+_ARTEMIS_BASE=$(echo "${ARTEMIS_HEARTBEAT_URL}" | sed 's|/nodes/heartbeat||')
+
+_REG_PAYLOAD=$(cat <<REGEOF
+{
+  "node_id": "${NODE_ID}",
+  "mesh_ip": "${_MESH_IP}",
+  "public_key": "${_WG_PUBKEY}",
+  "wg_server_addr": "${WG_SERVER_IP}",
+  "bootstrapped_at": $(date +%s),
+  "site": "${SITE}",
+  "region": "${REGION}"
+}
+REGEOF
+)
+
+_REG_RESP=$(curl -sf --max-time 15 -X POST "${_ARTEMIS_BASE}/nodes/register" \
+  -H "Authorization: Bearer ${NODE_AGENT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "$_REG_PAYLOAD" 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+  echo "  [ok] self-registration succeeded"
+else
+  echo "  [warn] self-registration failed (non-fatal — heartbeat will sync later)"
+fi
+
 echo ""
 echo "============================================"
 echo "  Bootstrap complete: ${NODE_ID}"
