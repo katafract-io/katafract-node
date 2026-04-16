@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # katafract-heartbeat — reports node health to Artemis every 30 s via systemd timer
 # Reads KATAFRACT_NODE_ID from /etc/katafract-node.env (set at provision time)
-set -euo pipefail
+set -eo pipefail
 
 ARTEMIS_URL="http://100.64.0.1/internal/nodes/heartbeat"
 TOKEN="e2675f896f618ac9eb23e05cb9686805bc4b3860f399a5e7e06e95582040b445"
@@ -33,6 +33,48 @@ if [ -n "$AWG" ]; then
         rx_bytes=$(( rx_bytes + rx ))
         tx_bytes=$(( tx_bytes + tx ))
     done < <("$AWG" show "$WG_IFACE" transfer 2>/dev/null || true)
+fi
+
+# ── WireGuard peer IPs ────────────────────────────────────────
+# Collect unique public endpoint IPs for GeoIP country analytics.
+# declare -A must be outside the if block to avoid set -u false-positive
+# on ${#seen_ips[@]} when the array is empty after all-(none) endpoints.
+
+peer_ips_json="[]"
+declare -A seen_ips
+
+if [ -n "$AWG" ]; then
+    while IFS=$'\t' read -r pubkey endpoint; do
+        # Skip missing endpoints
+        [ -z "$endpoint" ] || [ "$endpoint" = "(none)" ] && continue
+
+        # Strip port — handle IPv4 (1.2.3.4:51820) and IPv6 ([::1]:51820)
+        ip="$endpoint"
+        if [[ "$ip" == \[*\]:* ]]; then
+            ip="${ip%]:*}"; ip="${ip#\[}"
+        elif [[ "$ip" == *:* ]]; then
+            ip="${ip%:*}"
+        fi
+
+        # Skip private/CGNAT/loopback ranges
+        if [[ "$ip" =~ ^10\. ]] || \
+           [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] || \
+           [[ "$ip" =~ ^192\.168\. ]] || \
+           [[ "$ip" =~ ^100\.[6-9][0-9]\. ]] || \
+           [[ "$ip" =~ ^127\. ]]; then
+            continue
+        fi
+
+        seen_ips["$ip"]=1
+    done < <("$AWG" show "$WG_IFACE" endpoints 2>/dev/null || true)
+
+    if [ ${#seen_ips[@]} -gt 0 ]; then
+        ips_array=()
+        for ip in "${!seen_ips[@]}"; do
+            ips_array+=("\"$ip\"")
+        done
+        peer_ips_json="[$(IFS=,; echo "${ips_array[*]}")]"
+    fi
 fi
 
 # ── System metrics ────────────────────────────────────────────
@@ -80,6 +122,7 @@ curl -sf -X POST "$ARTEMIS_URL" \
     \"cpu_pct\":        $cpu_pct,
     \"mem_pct\":        $mem_pct,
     \"disk_pct\":       $disk_pct,
-    \"fail2ban_banned\": $fail2ban_banned
+    \"fail2ban_banned\": $fail2ban_banned,
+    \"peer_ips\":       $peer_ips_json
   }" \
   --max-time 10 || true

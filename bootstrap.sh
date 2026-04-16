@@ -443,61 +443,123 @@ echo "  [ok] node_exporter (:9100)"
 
 # ── 7. Katafract heartbeat agent ─────────────────────────────
 
-# Use awg show (not wg show) for AmneziaWG
 cat > /usr/local/bin/katafract-heartbeat << HBEOF
 #!/usr/bin/env bash
-set -euo pipefail
-
-source /etc/katafract-node.env
+set -eo pipefail
 
 ARTEMIS_URL="${ARTEMIS_HEARTBEAT_URL}"
 TOKEN="${NODE_AGENT_TOKEN}"
+source /etc/katafract-node.env
 NODE_ID="\${KATAFRACT_NODE_ID}"
 WG_IFACE="wg0"
 
-peers=\$(awg show "\$WG_IFACE" peers 2>/dev/null | wc -l)
+# Prefer awg (AmneziaWG) — fall back to wg if not installed
+AWG=\$(command -v awg || command -v wg || echo "")
 
-now=\$(date +%s)
+# ── WireGuard metrics ─────────────────────────────────────────
+
+registered_peers=0
 active_peers=0
-while IFS= read -r line; do
-  ts=\$(echo "\$line" | awk '{print \$2}')
-  if [ "\$ts" != "0" ] && [ \$((now - ts)) -le 180 ]; then
-    active_peers=\$((active_peers + 1))
-  fi
-done < <(awg show "\$WG_IFACE" latest-handshakes 2>/dev/null)
-
 rx_bytes=0
 tx_bytes=0
-while IFS=\$'\t' read -r _ rx tx; do
-  rx_bytes=\$((rx_bytes + rx))
-  tx_bytes=\$((tx_bytes + tx))
-done < <(awg show "\$WG_IFACE" transfer 2>/dev/null)
 
-cpu_pct=\$(top -bn1 | awk '/^%Cpu/{print int(\$2+\$4)}' 2>/dev/null || echo 0)
-mem_pct=\$(free | awk '/^Mem/{printf "%d", \$3/\$2*100}' 2>/dev/null || echo 0)
-disk_pct=\$(df / | awk 'NR==2{print int(\$5)}' 2>/dev/null || echo 0)
-banned=\$(fail2ban-client status sshd 2>/dev/null | awk '/Currently banned/{print \$NF}' || echo 0)
+if [ -n "\$AWG" ]; then
+    registered_peers=\$("\$AWG" show "\$WG_IFACE" peers 2>/dev/null | wc -l || echo 0)
 
-payload=\$(cat <<JSON
-{
-  "node_id": "\$NODE_ID",
-  "peers": \$peers,
-  "active_peers": \$active_peers,
-  "rx_bytes": \$rx_bytes,
-  "tx_bytes": \$tx_bytes,
-  "cpu_pct": \$cpu_pct,
-  "mem_pct": \$mem_pct,
-  "disk_pct": \$disk_pct,
-  "fail2ban_banned": \$banned,
-  "healthy": true
-}
-JSON
-)
+    now=\$(date +%s)
+    while IFS=\$'\t' read -r _ ts; do
+        if [ "\$ts" != "0" ] && [ \$(( now - ts )) -le 180 ]; then
+            active_peers=\$(( active_peers + 1 ))
+        fi
+    done < <("\$AWG" show "\$WG_IFACE" latest-handshakes 2>/dev/null || true)
+
+    while IFS=\$'\t' read -r _ rx tx; do
+        rx_bytes=\$(( rx_bytes + rx ))
+        tx_bytes=\$(( tx_bytes + tx ))
+    done < <("\$AWG" show "\$WG_IFACE" transfer 2>/dev/null || true)
+fi
+
+# ── WireGuard peer IPs (GeoIP country analytics) ─────────────
+# declare -A outside if block — set -u false-positive on empty assoc array
+
+peer_ips_json="[]"
+declare -A seen_ips
+
+if [ -n "\$AWG" ]; then
+    while IFS=\$'\t' read -r pubkey endpoint; do
+        [ -z "\$endpoint" ] || [ "\$endpoint" = "(none)" ] && continue
+        ip="\$endpoint"
+        if [[ "\$ip" == \[*\]:* ]]; then
+            ip="\${ip%]:*}"; ip="\${ip#\[}"
+        elif [[ "\$ip" == *:* ]]; then
+            ip="\${ip%:*}"
+        fi
+        if [[ "\$ip" =~ ^10\. ]] || \
+           [[ "\$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] || \
+           [[ "\$ip" =~ ^192\.168\. ]] || \
+           [[ "\$ip" =~ ^100\.[6-9][0-9]\. ]] || \
+           [[ "\$ip" =~ ^127\. ]]; then
+            continue
+        fi
+        seen_ips["\$ip"]=1
+    done < <("\$AWG" show "\$WG_IFACE" endpoints 2>/dev/null || true)
+
+    if [ \${#seen_ips[@]} -gt 0 ]; then
+        ips_array=()
+        for ip in "\${!seen_ips[@]}"; do
+            ips_array+=("\"\$ip\"")
+        done
+        peer_ips_json="[\$(IFS=,; echo "\${ips_array[*]}")]"
+    fi
+fi
+
+# ── System metrics ────────────────────────────────────────────
+
+ncpu=\$(nproc 2>/dev/null || echo 1)
+load1=\$(awk '{print \$1}' /proc/loadavg)
+cpu_pct=\$(awk "BEGIN{v=\$load1*100/\$ncpu; if(v>100) v=100; printf \"%d\", v}")
+
+mem_total=\$(awk '/MemTotal/{print \$2}' /proc/meminfo)
+mem_avail=\$(awk '/MemAvailable/{print \$2}' /proc/meminfo)
+mem_pct=\$(( (mem_total - mem_avail) * 100 / mem_total ))
+
+disk_pct=\$(df / 2>/dev/null | awk 'NR==2{gsub("%",""); print \$5}')
+disk_pct=\${disk_pct:-0}
+
+fail2ban_banned=0
+if timeout 3 systemctl is-active fail2ban >/dev/null 2>&1; then
+    jails=\$(timeout 5 fail2ban-client status 2>/dev/null \
+        | awk -F':\t' '/Jail list/{print \$2}' \
+        | tr ', ' '\n' | grep -v '^\$')
+    if [ -n "\$jails" ]; then
+        total=0
+        while IFS= read -r jail; do
+            count=\$(timeout 5 fail2ban-client status "\$jail" 2>/dev/null \
+                | awk '/Currently banned/{print \$NF}')
+            total=\$(( total + \${count:-0} ))
+        done <<< "\$jails"
+        fail2ban_banned=\$total
+    fi
+fi
+
+# ── Report ────────────────────────────────────────────────────
 
 curl -sf -X POST "\$ARTEMIS_URL" \
   -H "Authorization: Bearer \$TOKEN" \
   -H "Content-Type: application/json" \
-  -d "\$payload" \
+  -d "{
+    \"node_id\":        \"\$NODE_ID\",
+    \"peers\":          \$registered_peers,
+    \"active_peers\":   \$active_peers,
+    \"rx_bytes\":       \$rx_bytes,
+    \"tx_bytes\":       \$tx_bytes,
+    \"healthy\":        true,
+    \"cpu_pct\":        \$cpu_pct,
+    \"mem_pct\":        \$mem_pct,
+    \"disk_pct\":       \$disk_pct,
+    \"fail2ban_banned\": \$fail2ban_banned,
+    \"peer_ips\":       \$peer_ips_json
+  }" \
   --max-time 10 || true
 HBEOF
 chmod +x /usr/local/bin/katafract-heartbeat
