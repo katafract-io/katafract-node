@@ -83,6 +83,19 @@ sysctl -p /etc/sysctl.d/99-katafract.conf
 
 echo "  [ok] system packages"
 
+# ── 1b. Vendor-agnostic DNS ───────────────────────────────────
+# Pin to public DNS at boot — never rely on provider-assigned resolvers
+# (Vultr and Hetzner DNS can fail at startup; tailscale must not override this)
+cat > /etc/systemd/resolved.conf << 'EOF'
+[Resolve]
+DNS=1.1.1.1 9.9.9.9
+FallbackDNS=1.0.0.1 8.8.8.8
+DNSStubListener=yes
+DNSSEC=no
+EOF
+systemctl restart systemd-resolved
+echo "  [ok] vendor-agnostic DNS (1.1.1.1/9.9.9.9)"
+
 # ── 2. AmneziaWG (obfuscated WireGuard) ──────────────────────
 
 add-apt-repository -y ppa:amnezia/ppa 2>&1 | tail -2
