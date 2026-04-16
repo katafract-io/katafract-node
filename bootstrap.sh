@@ -87,7 +87,10 @@ echo "  [ok] system packages"
 
 add-apt-repository -y ppa:amnezia/ppa 2>&1 | tail -2
 apt-get update -qq
-apt-get install -y -qq amneziawg amneziawg-tools 2>&1 | tail -3
+apt-get install -y -qq linux-headers-$(uname -r) amneziawg amneziawg-tools 2>&1 | tail -3
+
+# Verify AmneziaWG kernel module loads
+modprobe amneziawg || { echo "[FATAL] amneziawg kernel module failed to load"; exit 1; }
 
 # Derive public key
 WG_PUBLIC_KEY=$(echo "$WG_PRIVATE_KEY" | awg pubkey)
@@ -148,6 +151,36 @@ ln -sf /etc/amnezia/amneziawg/wg0.conf /etc/wireguard/wg0.conf
 
 systemctl enable awg-quick@wg0
 systemctl restart awg-quick@wg0
+
+# Persistent DKMS safety net: on every boot, ensure amneziawg is built for the
+# running kernel before awg-quick starts. Handles kernel updates via unattended-upgrades.
+cat > /usr/local/sbin/ensure-amneziawg.sh << 'SAFETY'
+#!/bin/bash
+KERNEL=$(uname -r)
+if ! modprobe amneziawg 2>/dev/null; then
+    apt-get install -y -q linux-headers-${KERNEL} || true
+    dkms install amneziawg/$(dkms status amneziawg | head -1 | awk -F'[/,]' '{print $2}' | tr -d ' ') -k ${KERNEL} || true
+    modprobe amneziawg
+fi
+SAFETY
+chmod +x /usr/local/sbin/ensure-amneziawg.sh
+
+cat > /etc/systemd/system/ensure-amneziawg.service << 'SVC'
+[Unit]
+Description=Ensure AmneziaWG kernel module for current kernel
+DefaultDependencies=no
+Before=awg-quick@wg0.service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ensure-amneziawg.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVC
+systemctl enable ensure-amneziawg.service
 
 echo "  [ok] AmneziaWG (interface: $WG_SERVER_IP, port: $WG_LISTEN_PORT)"
 
