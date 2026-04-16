@@ -162,6 +162,7 @@ chmod 600 /etc/amnezia/amneziawg/wg0.conf
 mkdir -p /etc/wireguard
 ln -sf /etc/amnezia/amneziawg/wg0.conf /etc/wireguard/wg0.conf
 
+systemctl disable wg-quick@wg0 2>/dev/null || true
 systemctl enable awg-quick@wg0
 systemctl restart awg-quick@wg0
 
