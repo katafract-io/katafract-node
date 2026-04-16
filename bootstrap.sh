@@ -393,7 +393,7 @@ done
 # Restrict root to mesh-only, allow artemis+tek from anywhere
 sed -i 's/^#\?AllowUsers.*//' /etc/ssh/sshd_config
 echo "AllowUsers root@100.64.* tek artemis" >> /etc/ssh/sshd_config
-systemctl reload sshd
+systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
 
 echo "  [ok] SSH hardening (root mesh-only, artemis/tek anywhere)"
 
