@@ -47,7 +47,15 @@ set -euo pipefail
 : "${REGION:=unknown}"
 : "${WG_IPV6_TUNNEL:=}"
 
+# wg1 — standard WireGuard listener for home routers (no AmneziaWG).
+# CIDR mirrors wg0's 10.10.X.0/24 → 10.11.X.0/24. Port 51821 uniform.
+: "${WG1_LISTEN_PORT:=51821}"
+WG1_IPV4_TUNNEL_DEFAULT=$(echo "$WG_IPV4_TUNNEL" | sed 's|^10\.10\.|10.11.|')
+: "${WG1_IPV4_TUNNEL:=$WG1_IPV4_TUNNEL_DEFAULT}"
+
 WG_SERVER_IP=$(echo "$WG_IPV4_TUNNEL" | cut -d/ -f1)
+WG1_SERVER_IP=$(echo "$WG1_IPV4_TUNNEL" | cut -d/ -f1)
+WG1_SUBNET=$(echo "$WG1_IPV4_TUNNEL" | sed 's|\.[0-9]*/|.0/|')
 
 echo "==> Bootstrapping WraithGate node: $NODE_ID ($SITE / $REGION)"
 
@@ -198,6 +206,43 @@ systemctl enable ensure-amneziawg.service
 
 echo "  [ok] AmneziaWG (interface: $WG_SERVER_IP, port: $WG_LISTEN_PORT)"
 
+# ── 2b. Standard WireGuard wg1 (router listener) ───────────────
+#
+# Home routers (OpenWRT/DD-WRT/Mikrotik/Ubiquiti) only speak stock WireGuard.
+# wg1 is a second listener, separate port + subnet, no AWG magic numbers,
+# served by `/v1/peers/provision-router` on artemis-api.
+# See project_router_wg_endpoint_2026_04_21.md in memory.
+
+mkdir -p /etc/wireguard
+chmod 755 /etc/wireguard
+if [ ! -f /etc/wireguard/wg1.key ]; then
+  (umask 077; wg genkey > /etc/wireguard/wg1.key)
+  cat /etc/wireguard/wg1.key | wg pubkey > /etc/wireguard/wg1.pub
+  chmod 600 /etc/wireguard/wg1.key
+  chmod 644 /etc/wireguard/wg1.pub
+fi
+WG1_PRIVKEY=$(cat /etc/wireguard/wg1.key)
+WG1_PUBKEY=$(cat /etc/wireguard/wg1.pub)
+
+cat > /etc/wireguard/wg1.conf << WG1CONF
+[Interface]
+Address = ${WG1_IPV4_TUNNEL}
+ListenPort = ${WG1_LISTEN_PORT}
+PrivateKey = ${WG1_PRIVKEY}
+# Standard WireGuard (not AmneziaWG). Router clients.
+# Peer isolation: wg1→internet only, no P2P, no mesh.
+PostUp = iptables -A FORWARD -i wg1 -o ${DEFAULT_IFACE} -j ACCEPT; iptables -A FORWARD -i ${DEFAULT_IFACE} -o wg1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; iptables -A FORWARD -i wg1 -j DROP; iptables -t nat -A POSTROUTING -s ${WG1_SUBNET} -o ${DEFAULT_IFACE} -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg1 -o ${DEFAULT_IFACE} -j ACCEPT; iptables -D FORWARD -i ${DEFAULT_IFACE} -o wg1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; iptables -D FORWARD -i wg1 -j DROP; iptables -t nat -D POSTROUTING -s ${WG1_SUBNET} -o ${DEFAULT_IFACE} -j MASQUERADE
+WG1CONF
+chmod 600 /etc/wireguard/wg1.conf
+
+systemctl enable wg-quick@wg1 2>&1 | tail -1
+systemctl restart wg-quick@wg1
+sleep 1
+systemctl is-active wg-quick@wg1 >/dev/null || { echo "[FATAL] wg1 failed to start"; journalctl -u wg-quick@wg1 -n 20 --no-pager; exit 1; }
+
+echo "  [ok] Standard WireGuard wg1 (interface: $WG1_SERVER_IP, port: $WG1_LISTEN_PORT, pubkey: $WG1_PUBKEY)"
+
 # ── 3. AdGuard Home ───────────────────────────────────────────
 
 mkdir -p /opt/adguardhome/conf /opt/adguardhome/work
@@ -232,6 +277,7 @@ theme: auto
 dns:
   bind_hosts:
     - ${WG_SERVER_IP}
+    - ${WG1_SERVER_IP}
   port: 53
   anonymize_client_ip: false
   ratelimit: 20
@@ -363,8 +409,11 @@ ufw default allow outgoing
 ufw default allow routed
 ufw allow 22/tcp comment 'SSH'
 ufw allow "${WG_LISTEN_PORT}/udp" comment 'WireGuard AWG'
-ufw allow in on wg0 to any port 53 proto udp comment 'Haven DNS'
-ufw allow in on wg0 to any port 53 proto tcp comment 'Haven DNS TCP'
+ufw allow "${WG1_LISTEN_PORT}/udp" comment 'WireGuard router (standard)'
+ufw allow in on wg0 to any port 53 proto udp comment 'Haven DNS (wg0)'
+ufw allow in on wg0 to any port 53 proto tcp comment 'Haven DNS TCP (wg0)'
+ufw allow in on wg1 to any port 53 proto udp comment 'Haven DNS (wg1)'
+ufw allow in on wg1 to any port 53 proto tcp comment 'Haven DNS TCP (wg1)'
 ufw --force enable
 
 echo "  [ok] UFW firewall"
@@ -649,15 +698,19 @@ MESH_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
 
 cat > /etc/katafract-node.json << EOF
 {
-  "node_id":    "${NODE_ID}",
-  "site":       "${SITE}",
-  "region":     "${REGION}",
-  "public_ip":  "${PUBLIC_IP}",
-  "mesh_ip":    "${MESH_IP}",
-  "wg_pubkey":  "${WG_PUBLIC_KEY}",
-  "wg_port":    ${WG_LISTEN_PORT},
-  "wg_addr":    "${WG_SERVER_IP}",
-  "bootstrapped_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "node_id":          "${NODE_ID}",
+  "site":             "${SITE}",
+  "region":           "${REGION}",
+  "public_ip":        "${PUBLIC_IP}",
+  "mesh_ip":          "${MESH_IP}",
+  "wg_pubkey":        "${WG_PUBLIC_KEY}",
+  "wg_port":          ${WG_LISTEN_PORT},
+  "wg_addr":          "${WG_SERVER_IP}",
+  "wg1_pubkey":       "${WG1_PUBKEY}",
+  "wg1_port":         ${WG1_LISTEN_PORT},
+  "wg1_addr":         "${WG1_SERVER_IP}",
+  "wg1_client_cidr":  "${WG1_SUBNET}",
+  "bootstrapped_at":  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
 
@@ -674,6 +727,10 @@ _REG_PAYLOAD=$(cat <<REGEOF
   "mesh_ip": "${_MESH_IP}",
   "public_key": "${_WG_PUBKEY}",
   "wg_server_addr": "${WG_SERVER_IP}",
+  "wg1_public_key": "${WG1_PUBKEY}",
+  "wg1_port": ${WG1_LISTEN_PORT},
+  "wg1_client_cidr": "${WG1_SUBNET}",
+  "wg1_server_addr": "${WG1_SERVER_IP}",
   "bootstrapped_at": $(date +%s),
   "site": "${SITE}",
   "region": "${REGION}"
@@ -695,9 +752,12 @@ fi
 echo ""
 echo "============================================"
 echo "  Bootstrap complete: ${NODE_ID}"
-echo "  WireGuard pubkey:   ${WG_PUBLIC_KEY}"
-echo "  WireGuard addr:     ${WG_SERVER_IP}"
-echo "  WireGuard port:     ${WG_LISTEN_PORT}"
+echo "  AWG pubkey (wg0):   ${WG_PUBLIC_KEY}"
+echo "  AWG addr:           ${WG_SERVER_IP}"
+echo "  AWG port:           ${WG_LISTEN_PORT}"
+echo "  Std pubkey (wg1):   ${WG1_PUBKEY}"
+echo "  Std addr:           ${WG1_SERVER_IP}"
+echo "  Std port:           ${WG1_LISTEN_PORT}"
 echo "  Public IP:          ${PUBLIC_IP}"
 echo "  Mesh IP:            ${MESH_IP}"
 echo "============================================"
