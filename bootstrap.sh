@@ -16,7 +16,7 @@
 #
 # Required env vars:
 #   NODE_ID               — unique node identifier (e.g. vpn-eu-03)
-#   WG_PRIVATE_KEY        — WireGuard private key (awg genkey)
+#   WG_PRIVATE_KEY        — WireGuard private key (wg genkey)
 #   WG_IPV4_TUNNEL        — WireGuard server interface IP/CIDR (e.g. 10.10.5.1/24)
 #   WG_LISTEN_PORT        — WireGuard listen port (default: 51820)
 #   HEADSCALE_PREAUTH_KEY — reusable pre-auth key from headscale
@@ -47,7 +47,7 @@ set -euo pipefail
 : "${REGION:=unknown}"
 : "${WG_IPV6_TUNNEL:=}"
 
-# wg1 — standard WireGuard listener for home routers (no AmneziaWG).
+# wg1 — standard WireGuard listener for home routers.
 # CIDR mirrors wg0's 10.10.X.0/24 → 10.11.X.0/24. Port 51821 uniform.
 : "${WG1_LISTEN_PORT:=51821}"
 WG1_IPV4_TUNNEL_DEFAULT=$(echo "$WG_IPV4_TUNNEL" | sed 's|^10\.10\.|10.11.|')
@@ -104,25 +104,16 @@ EOF
 systemctl restart systemd-resolved
 echo "  [ok] vendor-agnostic DNS (1.1.1.1/9.9.9.9)"
 
-# ── 2. AmneziaWG (obfuscated WireGuard) ──────────────────────
-
-add-apt-repository -y ppa:amnezia/ppa 2>&1 | tail -2
-apt-get update -qq
-apt-get install -y -qq linux-headers-$(uname -r) amneziawg amneziawg-tools 2>&1 | tail -3
-
-# Verify AmneziaWG kernel module loads
-modprobe amneziawg || { echo "[FATAL] amneziawg kernel module failed to load"; exit 1; }
+# ── 2. Standard WireGuard (kernel-native) ────────────────────
+# wireguard-tools (wg CLI) already installed in section 1.
+# The wireguard kernel module ships with Ubuntu 22.04/24.04 — no DKMS needed.
 
 # Derive public key
-WG_PUBLIC_KEY=$(echo "$WG_PRIVATE_KEY" | awg pubkey)
+WG_PUBLIC_KEY=$(echo "$WG_PRIVATE_KEY" | wg pubkey)
 echo "$WG_PUBLIC_KEY" > /etc/wireguard/public.key
 
 # Detect default outbound interface
 DEFAULT_IFACE=$(ip route get 1.1.1.1 | grep -oP 'dev \K\S+')
-
-# AWG config goes in /etc/amnezia/amneziawg/ (awg-quick@wg0 looks here)
-mkdir -p /etc/amnezia/amneziawg
-chmod 700 /etc/amnezia/amneziawg
 
 # Build Address line (IPv4 + optional IPv6)
 if [ -n "$WG_IPV6_TUNNEL" ]; then
@@ -137,79 +128,32 @@ fi
 
 WG_SUBNET=$(echo "$WG_IPV4_TUNNEL" | sed 's|\.[0-9]*/|.0/|')
 
-cat > /etc/amnezia/amneziawg/wg0.conf << EOF
+mkdir -p /etc/wireguard
+chmod 700 /etc/wireguard
+
+cat > /etc/wireguard/wg0.conf << EOF
 [Interface]
 Address = ${WG_ADDRESS}
 ListenPort = ${WG_LISTEN_PORT}
 PrivateKey = ${WG_PRIVATE_KEY}
 
-# AWG obfuscation params (fleet-standard)
-Jc = 4
-Jmin = 40
-Jmax = 70
-S1 = 0
-S2 = 0
-H1 = 165494111
-H2 = 2783653322
-H3 = 825748096
-H4 = 2426479516
-
 # Peer isolation: clients get internet only, no mesh/P2P
 PostUp   = iptables -t nat -A POSTROUTING -s ${WG_SUBNET} -o ${DEFAULT_IFACE} -j MASQUERADE; ${IPV6_MASQ}iptables -A FORWARD -i wg0 -o ${DEFAULT_IFACE} -j ACCEPT; iptables -A FORWARD -i ${DEFAULT_IFACE} -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT; iptables -A FORWARD -i wg0 -o wg0 -j DROP; iptables -A FORWARD -i wg0 -d 100.64.0.0/10 -j DROP
 PostDown = iptables -t nat -D POSTROUTING -s ${WG_SUBNET} -o ${DEFAULT_IFACE} -j MASQUERADE; ${IPV6_MASQ_DOWN}iptables -D FORWARD -i wg0 -o ${DEFAULT_IFACE} -j ACCEPT; iptables -D FORWARD -i ${DEFAULT_IFACE} -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT; iptables -D FORWARD -i wg0 -o wg0 -j DROP; iptables -D FORWARD -i wg0 -d 100.64.0.0/10 -j DROP
 
-# Peers added dynamically by Artemis via awg addconf
+# Peers added dynamically by Artemis via wg addconf
 EOF
-chmod 600 /etc/amnezia/amneziawg/wg0.conf
+chmod 600 /etc/wireguard/wg0.conf
 
-# Symlink /etc/wireguard/wg0.conf → /etc/amnezia/amneziawg/wg0.conf so the
-# platform API's _ssh_add_peer helper (which reads/writes the canonical
-# /etc/wireguard/wg0.conf path) works on AmneziaWG nodes without branching.
-# Without this, multi-hop provisioning fails with "Operation not permitted"
-# during the post-addconf dedup/rewrite step.
-mkdir -p /etc/wireguard
-ln -sf /etc/amnezia/amneziawg/wg0.conf /etc/wireguard/wg0.conf
+systemctl enable wg-quick@wg0
+systemctl restart wg-quick@wg0
 
-systemctl disable wg-quick@wg0 2>/dev/null || true
-systemctl enable awg-quick@wg0
-systemctl restart awg-quick@wg0
-
-# Persistent DKMS safety net: on every boot, ensure amneziawg is built for the
-# running kernel before awg-quick starts. Handles kernel updates via unattended-upgrades.
-cat > /usr/local/sbin/ensure-amneziawg.sh << 'SAFETY'
-#!/bin/bash
-KERNEL=$(uname -r)
-if ! modprobe amneziawg 2>/dev/null; then
-    apt-get install -y -q linux-headers-${KERNEL} || true
-    dkms install amneziawg/$(dkms status amneziawg | head -1 | awk -F'[/,]' '{print $2}' | tr -d ' ') -k ${KERNEL} || true
-    modprobe amneziawg
-fi
-SAFETY
-chmod +x /usr/local/sbin/ensure-amneziawg.sh
-
-cat > /etc/systemd/system/ensure-amneziawg.service << 'SVC'
-[Unit]
-Description=Ensure AmneziaWG kernel module for current kernel
-DefaultDependencies=no
-Before=awg-quick@wg0.service
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/ensure-amneziawg.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-SVC
-systemctl enable ensure-amneziawg.service
-
-echo "  [ok] AmneziaWG (interface: $WG_SERVER_IP, port: $WG_LISTEN_PORT)"
+echo "  [ok] Standard WireGuard wg0 (interface: $WG_SERVER_IP, port: $WG_LISTEN_PORT)"
 
 # ── 2b. Standard WireGuard wg1 (router listener) ───────────────
 #
 # Home routers (OpenWRT/DD-WRT/Mikrotik/Ubiquiti) only speak stock WireGuard.
-# wg1 is a second listener, separate port + subnet, no AWG magic numbers,
+# wg1 is a second listener, separate port + subnet,
 # served by `/v1/peers/provision-router` on artemis-api.
 # See project_router_wg_endpoint_2026_04_21.md in memory.
 
@@ -229,7 +173,7 @@ cat > /etc/wireguard/wg1.conf << WG1CONF
 Address = ${WG1_IPV4_TUNNEL}
 ListenPort = ${WG1_LISTEN_PORT}
 PrivateKey = ${WG1_PRIVKEY}
-# Standard WireGuard (not AmneziaWG). Router clients.
+# Standard WireGuard. Router clients.
 # Peer isolation: wg1→internet only, no P2P, no mesh.
 PostUp = iptables -A FORWARD -i wg1 -o ${DEFAULT_IFACE} -j ACCEPT; iptables -A FORWARD -i ${DEFAULT_IFACE} -o wg1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; iptables -A FORWARD -i wg1 -j DROP; iptables -t nat -A POSTROUTING -s ${WG1_SUBNET} -o ${DEFAULT_IFACE} -j MASQUERADE
 PostDown = iptables -D FORWARD -i wg1 -o ${DEFAULT_IFACE} -j ACCEPT; iptables -D FORWARD -i ${DEFAULT_IFACE} -o wg1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; iptables -D FORWARD -i wg1 -j DROP; iptables -t nat -D POSTROUTING -s ${WG1_SUBNET} -o ${DEFAULT_IFACE} -j MASQUERADE
@@ -381,7 +325,7 @@ EOF
 cat > /etc/systemd/system/adguardhome.service << 'EOF'
 [Unit]
 Description=AdGuard Home DNS
-After=network-online.target awg-quick@wg0.service
+After=network-online.target wg-quick@wg0.service
 Wants=network-online.target
 
 [Service]
@@ -408,7 +352,7 @@ ufw default deny incoming
 ufw default allow outgoing
 ufw default allow routed
 ufw allow 22/tcp comment 'SSH'
-ufw allow "${WG_LISTEN_PORT}/udp" comment 'WireGuard AWG'
+ufw allow "${WG_LISTEN_PORT}/udp" comment 'WireGuard'
 ufw allow "${WG1_LISTEN_PORT}/udp" comment 'WireGuard router (standard)'
 ufw allow in on wg0 to any port 53 proto udp comment 'Haven DNS (wg0)'
 ufw allow in on wg0 to any port 53 proto tcp comment 'Haven DNS TCP (wg0)'
@@ -503,9 +447,6 @@ source /etc/katafract-node.env
 NODE_ID="\${KATAFRACT_NODE_ID}"
 WG_IFACE="wg0"
 
-# Prefer awg (AmneziaWG) — fall back to wg if not installed
-AWG=\$(command -v awg || command -v wg || echo "")
-
 # ── WireGuard metrics ─────────────────────────────────────────
 
 registered_peers=0
@@ -513,20 +454,20 @@ active_peers=0
 rx_bytes=0
 tx_bytes=0
 
-if [ -n "\$AWG" ]; then
-    registered_peers=\$("\$AWG" show "\$WG_IFACE" peers 2>/dev/null | wc -l || echo 0)
+if command -v wg &>/dev/null; then
+    registered_peers=\$(wg show "\$WG_IFACE" peers 2>/dev/null | wc -l || echo 0)
 
     now=\$(date +%s)
     while IFS=\$'\t' read -r _ ts; do
         if [ "\$ts" != "0" ] && [ \$(( now - ts )) -le 180 ]; then
             active_peers=\$(( active_peers + 1 ))
         fi
-    done < <("\$AWG" show "\$WG_IFACE" latest-handshakes 2>/dev/null || true)
+    done < <(wg show "\$WG_IFACE" latest-handshakes 2>/dev/null || true)
 
     while IFS=\$'\t' read -r _ rx tx; do
         rx_bytes=\$(( rx_bytes + rx ))
         tx_bytes=\$(( tx_bytes + tx ))
-    done < <("\$AWG" show "\$WG_IFACE" transfer 2>/dev/null || true)
+    done < <(wg show "\$WG_IFACE" transfer 2>/dev/null || true)
 fi
 
 # ── WireGuard peer IPs (GeoIP country analytics) ─────────────
@@ -535,7 +476,7 @@ fi
 peer_ips_json="[]"
 declare -A seen_ips
 
-if [ -n "\$AWG" ]; then
+if command -v wg &>/dev/null; then
     while IFS=\$'\t' read -r pubkey endpoint; do
         [ -z "\$endpoint" ] || [ "\$endpoint" = "(none)" ] && continue
         ip="\$endpoint"
@@ -552,7 +493,7 @@ if [ -n "\$AWG" ]; then
             continue
         fi
         seen_ips["\$ip"]=1
-    done < <("\$AWG" show "\$WG_IFACE" endpoints 2>/dev/null || true)
+    done < <(wg show "\$WG_IFACE" endpoints 2>/dev/null || true)
 
     if [ \${#seen_ips[@]} -gt 0 ]; then
         ips_array=()
@@ -621,7 +562,7 @@ EOF
 cat > /etc/systemd/system/katafract-heartbeat.service << 'EOF'
 [Unit]
 Description=Katafract node heartbeat
-After=network-online.target awg-quick@wg0.service
+After=network-online.target wg-quick@wg0.service
 
 [Service]
 Type=oneshot
@@ -718,7 +659,7 @@ EOF
 
 echo "[ok] registering with platform..."
 _MESH_IP=$(tailscale ip -4 2>/dev/null | head -1 || echo "")
-_WG_PUBKEY=$(awg show wg0 public-key 2>/dev/null || wg show wg0 public-key 2>/dev/null || echo "")
+_WG_PUBKEY=$(wg show wg0 public-key 2>/dev/null || echo "")
 _ARTEMIS_BASE=$(echo "${ARTEMIS_HEARTBEAT_URL}" | sed 's|/nodes/heartbeat||')
 
 _REG_PAYLOAD=$(cat <<REGEOF
@@ -752,9 +693,9 @@ fi
 echo ""
 echo "============================================"
 echo "  Bootstrap complete: ${NODE_ID}"
-echo "  AWG pubkey (wg0):   ${WG_PUBLIC_KEY}"
-echo "  AWG addr:           ${WG_SERVER_IP}"
-echo "  AWG port:           ${WG_LISTEN_PORT}"
+echo "  WG pubkey (wg0):    ${WG_PUBLIC_KEY}"
+echo "  WG addr:            ${WG_SERVER_IP}"
+echo "  WG port:            ${WG_LISTEN_PORT}"
 echo "  Std pubkey (wg1):   ${WG1_PUBKEY}"
 echo "  Std addr:           ${WG1_SERVER_IP}"
 echo "  Std port:           ${WG1_LISTEN_PORT}"
