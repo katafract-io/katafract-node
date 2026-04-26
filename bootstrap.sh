@@ -3,7 +3,7 @@
 # Idempotent — safe to run multiple times on an existing node
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/katafractured/katafract-node/main/bootstrap.sh \
+#   curl -fsSL https://raw.githubusercontent.com/katafract-io/katafract-node/main/bootstrap.sh \
 #     | NODE_ID=vpn-eu-03 \
 #       WG_PRIVATE_KEY=<key> \
 #       WG_IPV4_TUNNEL=10.10.5.1/24 \
@@ -12,6 +12,8 @@
 #       HEADSCALE_PREAUTH_KEY=<key> \
 #       NODE_AGENT_TOKEN=<token> \
 #       AGH_PASSWORD=<plaintext-password> \
+#       BOOTSTRAP_CF_TOKEN=<cloudflare-api-token> \
+#       INFISICAL_TOKEN=<machine-identity-token> \
 #       bash
 #
 # Required env vars:
@@ -22,9 +24,15 @@
 #   HEADSCALE_PREAUTH_KEY — reusable pre-auth key from headscale
 #   NODE_AGENT_TOKEN      — shared secret for heartbeat auth with artemis-api
 #   AGH_PASSWORD          — AdGuard Home admin password (plaintext, will be bcrypt-hashed)
+#   BOOTSTRAP_CF_TOKEN    — Cloudflare DNS API token (used for LE cert DNS-01 challenge)
+#                           Read from Infisical prod/ as CF_API_TOKEN_KATAFRACT by provisioner
 #
 # Optional:
 #   WG_IPV6_TUNNEL        — WireGuard IPv6 tunnel address (e.g. fd10:0:5::1/64)
+#   NODE_FQDN             — SS-fallback TLS hostname (default: <NODE_ID>.vpn.katafract.com)
+#   INFISICAL_TOKEN       — machine identity token; if set, SERVER_PSK is auto-pushed to
+#                           Infisical at prod/wraith/ss/<NODE_ID>/SERVER_PSK
+#   INFISICAL_BASE_URL    — default: http://100.64.0.1:8080
 #   ARTEMIS_HEARTBEAT_URL — default: http://100.64.0.1/internal/nodes/heartbeat
 #   SITE                  — display name (e.g. Frankfurt)
 #   REGION                — region slug (e.g. eu-west)
@@ -344,6 +352,162 @@ systemctl restart adguardhome
 
 echo "  [ok] AdGuard Home (DNS on ${WG_SERVER_IP}:53)"
 
+# ── 3b. Shadowsocks-rust SS-fallback (multi-user EIH, single port 8443) ───
+#
+# Standing rule (feedback_ss_rust_124_nested_config_required.md):
+#   shadowsocks-rust 1.24.x MUST use nested "servers": [{...}] format.
+#   Flat top-level format silently drops users[] — user_manager stays None,
+#   EIH lookups fail with "decrypt header chunk failed". No parse error emitted.
+#   Verified end-to-end on vpn-iad-01 2026-04-26 with two concurrent users.
+#
+# Each node has one SERVER_PSK (SS-2022 master key). Per-user PSKs are appended
+# to users[] at peer provision time by artemis-api. Client password:
+#   "<SERVER_PSK>:<USER_PSK>"
+#
+# Required env:
+#   BOOTSTRAP_CF_TOKEN  — Cloudflare API token with DNS:edit for katafract.com
+#                         (read from INFISICAL at bootstrap time by provisioner;
+#                          never hardcoded here)
+#   NODE_FQDN           — <node_id>.vpn.katafract.com (e.g. vpn-iad-01.vpn.katafract.com)
+#                         Defaults to ${NODE_ID}.vpn.katafract.com if unset
+#   INFISICAL_TOKEN     — machine identity token for pushing PSK to Infisical
+#                         (usually already present from provisioner env)
+
+: "${BOOTSTRAP_CF_TOKEN:?Required for SS-fallback LE cert (set by provisioner from Infisical)}"
+: "${NODE_FQDN:=${NODE_ID}.vpn.katafract.com}"
+: "${INFISICAL_BASE_URL:=http://100.64.0.1:8080}"
+
+echo "==> Setting up SS-fallback for ${NODE_FQDN}..."
+
+# Install certbot + dns-cloudflare plugin + shadowsocks-rust
+apt-get install -y -qq certbot python3-certbot-dns-cloudflare
+
+# Install shadowsocks-rust + v2ray-plugin if not already present
+if [ ! -x /opt/shadowsocks-rust/ssservice ]; then
+  SS_VER="1.24.0"
+  curl -fsSL "https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${SS_VER}/shadowsocks-v${SS_VER}.x86_64-unknown-linux-gnu.tar.xz" \
+    | tar -xJ -C /tmp
+  install -d /opt/shadowsocks-rust
+  mv /tmp/ssservice /tmp/sslocal /tmp/ssmanager /opt/shadowsocks-rust/ 2>/dev/null || true
+  # ssservice is the primary binary; ensure it's there
+  ls /opt/shadowsocks-rust/ssservice >/dev/null || { echo "[FATAL] ssservice not found after extract"; exit 1; }
+fi
+
+if [ ! -x /usr/local/bin/v2ray-plugin ]; then
+  V2RAY_VER="5.1.0"
+  curl -fsSL "https://github.com/shadowsocks/v2ray-plugin/releases/download/v${V2RAY_VER}/v2ray-plugin-linux-amd64-v${V2RAY_VER}.tar.gz" \
+    | tar -xz -C /tmp
+  install -m 755 /tmp/v2ray-plugin_linux_amd64 /usr/local/bin/v2ray-plugin \
+    || install -m 755 /tmp/v2ray-plugin /usr/local/bin/v2ray-plugin
+fi
+
+# Cloudflare credentials for certbot
+install -d -m 700 /etc/letsencrypt
+cat > /etc/letsencrypt/cf-katafract.ini << EOF_CF
+dns_cloudflare_api_token = ${BOOTSTRAP_CF_TOKEN}
+EOF_CF
+chmod 600 /etc/letsencrypt/cf-katafract.ini
+
+# Obtain LE cert via DNS-01 (works even before node is publicly reachable on 443)
+certbot certonly \
+  --dns-cloudflare \
+  --dns-cloudflare-credentials /etc/letsencrypt/cf-katafract.ini \
+  --dns-cloudflare-propagation-seconds 30 \
+  -d "${NODE_FQDN}" \
+  --non-interactive \
+  --agree-tos \
+  --email christian@katafract.com \
+  || echo "  [warn] certbot returned non-zero — cert may already exist (idempotent run)"
+
+# Install LE renewal-hook so ssservice restarts post-renewal
+mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+cat > /etc/letsencrypt/renewal-hooks/deploy/restart-shadowsocks.sh <<'HOOK'
+#!/bin/bash
+# Reload ssservice so v2ray-plugin picks up the renewed cert
+if systemctl is-active --quiet shadowsocks-server.service; then
+  systemctl restart shadowsocks-server.service
+fi
+HOOK
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-shadowsocks.sh
+echo "  → LE deploy hook installed (auto-restart ssservice on cert renewal)"
+
+# Generate per-node SERVER_PSK
+install -d -m 700 /etc/shadowsocks
+if [ ! -f /etc/shadowsocks/poc-secrets.txt ]; then
+  SERVER_PSK=$(openssl rand -base64 32)
+  echo "SERVER_PSK=${SERVER_PSK}" > /etc/shadowsocks/poc-secrets.txt
+  chmod 600 /etc/shadowsocks/poc-secrets.txt
+else
+  # Idempotent: re-use existing PSK
+  SERVER_PSK=$(grep -oP '(?<=SERVER_PSK=).*' /etc/shadowsocks/poc-secrets.txt)
+fi
+
+# Write nested-format server config (CRITICAL: flat format silently drops users[])
+cat > /etc/shadowsocks/server.json << EOF_SS
+{
+  "servers": [
+    {
+      "server": "0.0.0.0",
+      "server_port": 8443,
+      "method": "2022-blake3-aes-256-gcm",
+      "password": "${SERVER_PSK}",
+      "users": [],
+      "mode": "tcp_and_udp",
+      "no_delay": true,
+      "fast_open": false,
+      "plugin": "/usr/local/bin/v2ray-plugin",
+      "plugin_opts": "server;tls;cert=/etc/letsencrypt/live/${NODE_FQDN}/fullchain.pem;key=/etc/letsencrypt/live/${NODE_FQDN}/privkey.pem;loglevel=warning"
+    }
+  ]
+}
+EOF_SS
+chmod 600 /etc/shadowsocks/server.json
+
+# Systemd unit
+cat > /etc/systemd/system/shadowsocks-server.service << 'EOF_SVC'
+[Unit]
+Description=Shadowsocks-rust server (multi-user, single-port, v2ray-plugin TLS)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/opt/shadowsocks-rust/ssservice server -c /etc/shadowsocks/server.json
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF_SVC
+
+systemctl daemon-reload
+systemctl enable shadowsocks-server.service
+systemctl restart shadowsocks-server.service
+sleep 2
+systemctl is-active shadowsocks-server.service >/dev/null \
+  || { echo "[FATAL] shadowsocks-server failed to start"; journalctl -u shadowsocks-server -n 20 --no-pager; exit 1; }
+
+echo "  [ok] shadowsocks-server (8443, multi-user EIH, v2ray-plugin TLS)"
+
+# Push SERVER_PSK to Infisical at prod/wraith/ss/<NODE_ID>/SERVER_PSK
+# Bootstrap already has the Infisical machine identity token injected by provisioner.
+if [ -n "${INFISICAL_TOKEN:-}" ]; then
+  INFISICAL_API_URL="${INFISICAL_BASE_URL}" \
+    infisical secrets set "SERVER_PSK=${SERVER_PSK}" \
+      --token "${INFISICAL_TOKEN}" \
+      --env prod \
+      --path "/wraith/ss/${NODE_ID}" \
+    && echo "  [ok] SERVER_PSK pushed to Infisical at prod/wraith/ss/${NODE_ID}" \
+    || echo "  [warn] Infisical push failed — push SERVER_PSK manually: prod/wraith/ss/${NODE_ID}/SERVER_PSK"
+else
+  echo "  [warn] INFISICAL_TOKEN not set — SERVER_PSK NOT pushed to Infisical"
+  echo "         Push manually: prod/wraith/ss/${NODE_ID}/SERVER_PSK"
+fi
+
+echo "  [ok] SS-fallback complete (port 8443, cert: ${NODE_FQDN})"
+
 # ── 4. UFW firewall ───────────────────────────────────────────
 
 apt-get install -y -qq ufw
@@ -358,6 +522,7 @@ ufw allow in on wg0 to any port 53 proto udp comment 'Haven DNS (wg0)'
 ufw allow in on wg0 to any port 53 proto tcp comment 'Haven DNS TCP (wg0)'
 ufw allow in on wg1 to any port 53 proto udp comment 'Haven DNS (wg1)'
 ufw allow in on wg1 to any port 53 proto tcp comment 'Haven DNS TCP (wg1)'
+ufw allow 8443/tcp comment 'Wraith SS+v2ray-plugin TLS'
 ufw --force enable
 
 echo "  [ok] UFW firewall"
@@ -672,6 +837,7 @@ _REG_PAYLOAD=$(cat <<REGEOF
   "wg1_port": ${WG1_LISTEN_PORT},
   "wg1_client_cidr": "${WG1_SUBNET}",
   "wg1_server_addr": "${WG1_SERVER_IP}",
+  "ss_fallback_endpoint": "${NODE_FQDN}:8443",
   "bootstrapped_at": $(date +%s),
   "site": "${SITE}",
   "region": "${REGION}"
@@ -699,6 +865,7 @@ echo "  WG port:            ${WG_LISTEN_PORT}"
 echo "  Std pubkey (wg1):   ${WG1_PUBKEY}"
 echo "  Std addr:           ${WG1_SERVER_IP}"
 echo "  Std port:           ${WG1_LISTEN_PORT}"
+echo "  SS-fallback:        ${NODE_FQDN}:8443 (TCP, v2ray-plugin TLS)"
 echo "  Public IP:          ${PUBLIC_IP}"
 echo "  Mesh IP:            ${MESH_IP}"
 echo "============================================"
