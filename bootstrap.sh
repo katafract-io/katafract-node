@@ -475,6 +475,18 @@ certbot certonly \
   --email christian@katafract.com \
   || echo "  [warn] certbot returned non-zero — cert may already exist (idempotent run)"
 
+# Install LE renewal-hook so ssservice restarts post-renewal
+mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+cat > /etc/letsencrypt/renewal-hooks/deploy/restart-shadowsocks.sh <<'HOOK'
+#!/bin/bash
+# Reload ssservice so v2ray-plugin picks up the renewed cert
+if systemctl is-active --quiet shadowsocks-server.service; then
+  systemctl restart shadowsocks-server.service
+fi
+HOOK
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-shadowsocks.sh
+echo "  → LE deploy hook installed (auto-restart ssservice on cert renewal)"
+
 # Generate per-node SERVER_PSK
 install -d -m 700 /etc/shadowsocks
 if [ ! -f /etc/shadowsocks/poc-secrets.txt ]; then
