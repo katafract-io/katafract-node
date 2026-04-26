@@ -659,6 +659,10 @@ WG_IFACE="wg0"
 # Prefer awg (AmneziaWG) — fall back to wg if not installed
 AWG=\$(command -v awg || command -v wg || echo "")
 
+# ── Integer sanitization helper ───────────────────────────────
+to_int() { printf '%d' "${1:-0}" 2>/dev/null || echo 0; }
+
+
 # ── WireGuard metrics ─────────────────────────────────────────
 
 registered_peers=0
@@ -666,7 +670,7 @@ active_peers=0
 rx_bytes=0
 tx_bytes=0
 
-if [ -n "\$AWG" ]; then
+    registered_peers=\$(to_int "\$(\$AWG show \$WG_IFACE peers 2>/dev/null | wc -l)")
     registered_peers=\$("\$AWG" show "\$WG_IFACE" peers 2>/dev/null | wc -l || echo 0)
 
     now=\$(date +%s)
