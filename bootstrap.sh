@@ -614,13 +614,17 @@ WG_IFACE="wg0"
 
 # ── WireGuard metrics ─────────────────────────────────────────
 
+
+# ── Integer sanitization helper ───────────────────────────────
+to_int() { printf '%d' "${1:-0}" 2>/dev/null || echo 0; }
+
 registered_peers=0
 active_peers=0
 rx_bytes=0
 tx_bytes=0
 
 if command -v wg &>/dev/null; then
-    registered_peers=\$(wg show "\$WG_IFACE" peers 2>/dev/null | wc -l || echo 0)
+    registered_peers=\$(to_int "\$(wg show \$WG_IFACE peers 2>/dev/null | wc -l)")
 
     now=\$(date +%s)
     while IFS=\$'\t' read -r _ ts; do
