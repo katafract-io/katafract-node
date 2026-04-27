@@ -120,8 +120,14 @@ echo "  [ok] vendor-agnostic DNS (1.1.1.1/9.9.9.9)"
 WG_PUBLIC_KEY=$(echo "$WG_PRIVATE_KEY" | wg pubkey)
 echo "$WG_PUBLIC_KEY" > /etc/wireguard/public.key
 
-# Detect default outbound interface
-DEFAULT_IFACE=$(ip route get 1.1.1.1 | grep -oP 'dev \K\S+')
+# Auto-detect default outbound interface (handles eth0 / enp1s0 / ens3 / etc per provider)
+# Use `ip -4 route show default` for better stability across providers
+DEFAULT_IFACE=$(ip -4 route show default | awk '/^default/ {print $5; exit}')
+if [ -z "$DEFAULT_IFACE" ]; then
+  echo "::error::Cannot detect default outbound interface — aborting" >&2
+  exit 1
+fi
+echo "outbound iface: $DEFAULT_IFACE"
 
 # Build Address line (IPv4 + optional IPv6)
 if [ -n "$WG_IPV6_TUNNEL" ]; then
