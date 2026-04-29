@@ -462,7 +462,7 @@ cat > /etc/shadowsocks/server.json << EOF_SS
       "no_delay": true,
       "fast_open": false,
       "plugin": "/usr/local/bin/v2ray-plugin",
-      "plugin_opts": "server;tls;cert=/etc/letsencrypt/live/${NODE_FQDN}/fullchain.pem;key=/etc/letsencrypt/live/${NODE_FQDN}/privkey.pem;loglevel=warning"
+      "plugin_opts": "server;tls;mode=websocket;path=/;cert=/etc/letsencrypt/live/${NODE_FQDN}/fullchain.pem;key=/etc/letsencrypt/live/${NODE_FQDN}/privkey.pem;loglevel=warning"
     }
   ]
 }
