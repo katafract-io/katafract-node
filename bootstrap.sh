@@ -28,7 +28,13 @@
 #                           Read from Infisical prod/ as CF_API_TOKEN_KATAFRACT by provisioner
 #
 # Optional:
-#   WG_IPV6_TUNNEL        — WireGuard IPv6 tunnel address (e.g. fd10:0:5::1/64)
+#   WG_IPV6_TUNNEL        — wg0 IPv6 tunnel address (e.g. fd10:0:5::1/64).
+#                           Enables IPv6 internally so each phone/tablet can hold
+#                           its own /128 (no /24 client ceiling). AGH binds to
+#                           this address automatically.
+#   WG1_IPV6_TUNNEL       — wg1 (router endpoint) IPv6 tunnel address.
+#                           Defaults to WG_IPV6_TUNNEL with fd10:→fd11: when
+#                           WG_IPV6_TUNNEL is set. Leave unset to disable v6 on wg1.
 #   NODE_FQDN             — SS-fallback TLS hostname (default: <NODE_ID>.vpn.katafract.com)
 #   INFISICAL_TOKEN       — machine identity token; if set, SERVER_PSK is auto-pushed to
 #                           Infisical at prod/wraith/ss/<NODE_ID>/SERVER_PSK
@@ -64,6 +70,20 @@ WG1_IPV4_TUNNEL_DEFAULT=$(echo "$WG_IPV4_TUNNEL" | sed 's|^10\.10\.|10.11.|')
 WG_SERVER_IP=$(echo "$WG_IPV4_TUNNEL" | cut -d/ -f1)
 WG1_SERVER_IP=$(echo "$WG1_IPV4_TUNNEL" | cut -d/ -f1)
 WG1_SUBNET=$(echo "$WG1_IPV4_TUNNEL" | sed 's|\.[0-9]*/|.0/|')
+
+# Optional IPv6 ULA for wg1 (router endpoint). Mirrors wg0 v6 by swapping
+# fd10 → fd11 if WG_IPV6_TUNNEL is set and WG1_IPV6_TUNNEL isn't explicitly given.
+# IPv6 internally is the path to multi-client per phone (no /24 exhaustion).
+: "${WG1_IPV6_TUNNEL:=}"
+if [ -n "$WG_IPV6_TUNNEL" ] && [ -z "$WG1_IPV6_TUNNEL" ]; then
+  WG1_IPV6_TUNNEL=$(echo "$WG_IPV6_TUNNEL" | sed 's|^fd10:|fd11:|')
+fi
+
+# Strip CIDR for AGH bind_hosts (it wants a bare address, not a/64)
+WG_SERVER_IP6=""
+WG1_SERVER_IP6=""
+[ -n "$WG_IPV6_TUNNEL" ]  && WG_SERVER_IP6=$(echo "$WG_IPV6_TUNNEL"  | cut -d/ -f1)
+[ -n "$WG1_IPV6_TUNNEL" ] && WG1_SERVER_IP6=$(echo "$WG1_IPV6_TUNNEL" | cut -d/ -f1)
 
 echo "==> Bootstrapping WraithGate node: $NODE_ID ($SITE / $REGION)"
 
@@ -182,15 +202,26 @@ fi
 WG1_PRIVKEY=$(cat /etc/wireguard/wg1.key)
 WG1_PUBKEY=$(cat /etc/wireguard/wg1.pub)
 
+# Build wg1 Address (v4 + optional v6) and v6 MASQUERADE pair, mirroring wg0.
+if [ -n "$WG1_IPV6_TUNNEL" ]; then
+  WG1_ADDRESS="${WG1_IPV4_TUNNEL}, ${WG1_IPV6_TUNNEL}"
+  WG1_IPV6_MASQ="ip6tables -t nat -A POSTROUTING -s $(echo "$WG1_IPV6_TUNNEL" | sed 's|::1/64|::/64|') -o ${DEFAULT_IFACE} -j MASQUERADE; "
+  WG1_IPV6_MASQ_DOWN="ip6tables -t nat -D POSTROUTING -s $(echo "$WG1_IPV6_TUNNEL" | sed 's|::1/64|::/64|') -o ${DEFAULT_IFACE} -j MASQUERADE; "
+else
+  WG1_ADDRESS="${WG1_IPV4_TUNNEL}"
+  WG1_IPV6_MASQ=""
+  WG1_IPV6_MASQ_DOWN=""
+fi
+
 cat > /etc/wireguard/wg1.conf << WG1CONF
 [Interface]
-Address = ${WG1_IPV4_TUNNEL}
+Address = ${WG1_ADDRESS}
 ListenPort = ${WG1_LISTEN_PORT}
 PrivateKey = ${WG1_PRIVKEY}
 # Standard WireGuard. Router clients.
 # Peer isolation: wg1→internet only, no P2P, no mesh.
-PostUp = iptables -A FORWARD -i wg1 -o ${DEFAULT_IFACE} -j ACCEPT; iptables -A FORWARD -i ${DEFAULT_IFACE} -o wg1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; iptables -A FORWARD -i wg1 -j DROP; iptables -t nat -A POSTROUTING -s ${WG1_SUBNET} -o ${DEFAULT_IFACE} -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg1 -o ${DEFAULT_IFACE} -j ACCEPT; iptables -D FORWARD -i ${DEFAULT_IFACE} -o wg1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; iptables -D FORWARD -i wg1 -j DROP; iptables -t nat -D POSTROUTING -s ${WG1_SUBNET} -o ${DEFAULT_IFACE} -j MASQUERADE
+PostUp = iptables -A FORWARD -i wg1 -o ${DEFAULT_IFACE} -j ACCEPT; iptables -A FORWARD -i ${DEFAULT_IFACE} -o wg1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; iptables -A FORWARD -i wg1 -j DROP; iptables -t nat -A POSTROUTING -s ${WG1_SUBNET} -o ${DEFAULT_IFACE} -j MASQUERADE; ${WG1_IPV6_MASQ}true
+PostDown = iptables -D FORWARD -i wg1 -o ${DEFAULT_IFACE} -j ACCEPT; iptables -D FORWARD -i ${DEFAULT_IFACE} -o wg1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; iptables -D FORWARD -i wg1 -j DROP; iptables -t nat -D POSTROUTING -s ${WG1_SUBNET} -o ${DEFAULT_IFACE} -j MASQUERADE; ${WG1_IPV6_MASQ_DOWN}true
 WG1CONF
 chmod 600 /etc/wireguard/wg1.conf
 
@@ -233,9 +264,16 @@ http_proxy: ""
 language: ""
 theme: auto
 dns:
+  # Bind on every interior tunnel address — wg0 (phone) + wg1 (router),
+  # IPv4 + IPv6 when ULA prefixes are provisioned. Never bind on 0.0.0.0
+  # (the public iface) — that would expose AGH to internet scanners.
+  # IPv6 is the multi-client path: fd10:0:X::/64 fits 18e18 clients per node
+  # without the /24 (~250 client) ceiling we hit on v4.
   bind_hosts:
     - ${WG_SERVER_IP}
-    - ${WG1_SERVER_IP}
+    - ${WG1_SERVER_IP}${WG_SERVER_IP6:+
+    - ${WG_SERVER_IP6}}${WG1_SERVER_IP6:+
+    - ${WG1_SERVER_IP6}}
   port: 53
   anonymize_client_ip: false
   ratelimit: 20
