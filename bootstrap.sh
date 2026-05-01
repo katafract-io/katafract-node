@@ -529,6 +529,7 @@ ufw allow in on wg0 to any port 53 proto tcp comment 'Haven DNS TCP (wg0)'
 ufw allow in on wg1 to any port 53 proto udp comment 'Haven DNS (wg1)'
 ufw allow in on wg1 to any port 53 proto tcp comment 'Haven DNS TCP (wg1)'
 ufw allow 8443/tcp comment 'Wraith SS+v2ray-plugin TLS'
+ufw allow 8443/udp comment 'SS-2022 UDP relay'
 ufw --force enable
 
 echo "  [ok] UFW firewall"
