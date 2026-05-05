@@ -362,6 +362,8 @@ ufw default allow routed
 ufw allow 22/tcp comment 'SSH'
 ufw allow "${WG_LISTEN_PORT}/udp" comment 'WireGuard'
 ufw allow "${WG1_LISTEN_PORT}/udp" comment 'WireGuard router (standard)'
+ufw allow 443/tcp comment 'SS-2022 relay (WraithVPN Stealth legacy)'
+ufw allow 443/udp comment 'Hysteria2 QUIC (WraithVPN Stealth)'
 ufw allow in on wg0 to any port 53 proto udp comment 'Haven DNS (wg0)'
 ufw allow in on wg0 to any port 53 proto tcp comment 'Haven DNS TCP (wg0)'
 ufw allow in on wg1 to any port 53 proto udp comment 'Haven DNS (wg1)'
